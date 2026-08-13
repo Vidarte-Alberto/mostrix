@@ -3,7 +3,8 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use mostro_core::chat::{
-    chat_filter, unwrap_chat_message, unwrap_giftwrap_chat_message, wrap_chat_message, SharedKey,
+    chat_filter, unwrap_chat_message, unwrap_giftwrap_chat_message, wrap_chat_message,
+    wrap_giftwrap_chat_message, SharedKey,
 };
 use mostro_core::prelude::DisputeStatus;
 use mostro_core::prelude::SmallOrder;
@@ -419,21 +420,34 @@ pub async fn fetch_observer_chat(
 }
 
 /// Send one user order chat message using shared-key wrapping.
+async fn build_user_order_chat_event(
+    trade_keys: &Keys,
+    shared_keys: &Keys,
+    content: &str,
+) -> Result<Event> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err(anyhow::anyhow!("Cannot send empty order chat message"));
+    }
+    wrap_giftwrap_chat_message(trade_keys, &shared_keys.public_key(), content)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to wrap order chat message: {e}"))
+}
+
+/// Send one user order chat message using the Mobile-compatible GiftWrap envelope.
 pub async fn send_user_order_chat_message_via_shared_key(
     client: &Client,
     trade_keys: &Keys,
     shared_keys: &Keys,
     content: &str,
-    mostro_instance: Option<&MostroInstanceInfo>,
+    _mostro_instance: Option<&MostroInstanceInfo>,
 ) -> Result<()> {
-    send_admin_chat_message_via_shared_key(
-        client,
-        trade_keys,
-        shared_keys,
-        content,
-        mostro_instance,
-    )
-    .await
+    let event = build_user_order_chat_event(trade_keys, shared_keys, content).await?;
+    client
+        .send_event(&event)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send order chat event: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -526,6 +540,28 @@ mod tests {
 
         assert_eq!(unwrapped.2, sender.public_key());
         assert_eq!(unwrapped.0, content);
+    }
+
+    #[tokio::test]
+    async fn mobile_compatible_order_chat_uses_giftwrap_envelope() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let shared = SharedKey::derive(sender.secret_key(), &receiver.public_key())
+            .expect("shared key derives");
+        let event = build_user_order_chat_event(&sender, shared.keys(), "hello mobile")
+            .await
+            .expect("gift wrap succeeds");
+
+        assert_eq!(event.kind, Kind::GiftWrap);
+        assert!(event
+            .tags
+            .public_keys()
+            .any(|pk| *pk == shared.keys().public_key()));
+        let decoded = unwrap_giftwrap_chat_message(shared.keys(), &event)
+            .await
+            .expect("gift wrap decodes");
+        assert_eq!(decoded.content, "hello mobile");
+        assert_eq!(decoded.sender, sender.public_key());
     }
 
     #[test]
