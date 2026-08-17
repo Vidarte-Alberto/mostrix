@@ -39,18 +39,18 @@ pub const HELP_DP_ENTER_TAKE: &str = "Enter: Take selected dispute";
 pub const HELP_DP_SELECT_DISPUTE: &str = "↑↓: Select dispute";
 
 // Help popup lines (Observer)
-pub const HELP_OBS_ENTER_LOAD: &str = "Enter: Load chat for shared key";
+pub const HELP_OBS_ENTER_LOAD: &str = "Enter: Load chat for K_conv";
 #[cfg(any(
     target_os = "linux",
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd"
 ))]
-pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+Shift+V: Paste shared key";
+pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+Shift+V: Paste into focused field";
 #[cfg(target_os = "windows")]
-pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+V: Paste shared key";
+pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+V: Paste into focused field";
 #[cfg(target_os = "macos")]
-pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Cmd+V: Paste shared key";
+pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Cmd+V: Paste into focused field";
 #[cfg(not(any(
     target_os = "linux",
     target_os = "freebsd",
@@ -59,12 +59,13 @@ pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Cmd+V: Paste shared key";
     target_os = "windows",
     target_os = "macos"
 )))]
-pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+V: Paste shared key";
+pub const HELP_OBS_PASTE_SHARED_KEY: &str = "Ctrl+V: Paste into focused field";
 pub const HELP_OBS_SCROLL_LINE: &str = "↑↓: Scroll messages";
 pub const HELP_OBS_SCROLL_PAGE: &str = "PgUp/PgDn: Scroll page";
 pub const HELP_OBS_ESC_CLEAR_ERR: &str = "Esc: Clear error";
 pub const HELP_OBS_CTRL_C_CLEAR: &str = "Ctrl+C: Clear all";
 pub const HELP_OBS_CTRL_S_ATTACH: &str = "Ctrl+S: Save attachment";
+pub const HELP_OBS_TAB_FOCUS: &str = "Tab: Switch K_conv / pub(K_sign) fields";
 
 // Help popup lines (Settings)
 pub const HELP_SETTINGS_SWITCH_FROM_MENU: &str =
@@ -90,6 +91,7 @@ pub const HELP_ORDERS_CANCEL_PENDING_MSG: &str =
 // Help popup lines (My Trades)
 pub const HELP_MY_TRADES_NAV: &str = "↑↓: Select order";
 pub const HELP_MY_TRADES_ENTER_SEND: &str = "Enter: Send message (when input enabled)";
+pub const HELP_MY_TRADES_TAB_CHAT: &str = "Tab: Switch Peer/Solver chat (after solver assignment)";
 pub const HELP_MY_TRADES_SHIFT_I: &str = "Shift+I: Enable/disable message input";
 pub const HELP_MY_TRADES_SHIFT_C_CANCEL: &str = "Shift+C: Cancel order (cooperative cancel)";
 pub const HELP_MY_TRADES_SHIFT_F_FIAT_SENT: &str = "Shift+F: Mark fiat as sent (FiatSent message)";
@@ -97,6 +99,8 @@ pub const HELP_MY_TRADES_SHIFT_R_RELEASE: &str = "Shift+R: Release sats (Release
 pub const HELP_MY_TRADES_SHIFT_V_RATE: &str = "Shift+V: Rate counterparty (open rating popup)";
 pub const HELP_MY_TRADES_SHIFT_D_DISPUTE: &str = "Shift+D: Open a dispute (Dispute message)";
 pub const HELP_MY_TRADES_SHIFT_H_HELP: &str = "Shift+H: Show shortcuts help";
+pub const HELP_MY_TRADES_SHIFT_K_KCONV: &str =
+    "Shift+K: Reveal K_conv (read-only grant for solvers; never K_sign)";
 pub const HELP_MY_TRADES_CTRL_S_ATTACH: &str = "Ctrl+S: Save attachment (choose from list)";
 pub const HELP_MY_TRADES_CTRL_O_SEND: &str = "Ctrl+O: Send attachment (file picker)";
 pub const HELP_MY_TRADES_CTRL_SHIFT_O_RETRY: &str =
@@ -174,13 +178,16 @@ pub const FOOTER_PGUP_PGDN_SCROLL_CHAT: &str = "PgUp/PgDn: Scroll Chat";
 // --- Footer (My Trades / Order Chat) ---
 
 pub const FOOTER_MYTRADES_SELECT_ORDER: &str = "↑↓: Select order";
+pub const FOOTER_MYTRADES_TAB_CHAT: &str = "Tab: Peer/Solver chat";
 pub const FOOTER_MYTRADES_ENTER_SEND: &str = "Enter: Send";
 pub const FOOTER_MYTRADES_SHIFT_I_DISABLE: &str = "Shift+I: Disable input";
 pub const FOOTER_MYTRADES_SHIFT_I_ENABLE: &str = "Shift+I: Enable input";
 pub const FOOTER_MYTRADES_SHIFT_C_CANCEL: &str = "Shift+C: Cancel order";
+pub const FOOTER_MYTRADES_SHIFT_D_DISPUTE: &str = "Shift+D: Dispute";
 pub const FOOTER_MYTRADES_SHIFT_F_FIAT_SENT: &str = "Shift+F: Mark fiat sent";
 pub const FOOTER_MYTRADES_SHIFT_R_RELEASE: &str = "Shift+R: Release sats";
 pub const FOOTER_MYTRADES_SHIFT_V_RATE: &str = "Shift+V: Rate counterparty";
+pub const FOOTER_MYTRADES_SHIFT_K_KCONV: &str = "Shift+K: Reveal K_conv";
 pub const FOOTER_MYTRADES_PGUP_PGDN_SCROLL_CHAT: &str = "PgUp/PgDn: Scroll chat";
 pub const FOOTER_MYTRADES_END_BOTTOM: &str = "End: Bottom";
 

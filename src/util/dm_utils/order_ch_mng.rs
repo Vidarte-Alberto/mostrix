@@ -262,6 +262,8 @@ pub fn handle_operation_result(mut result: OperationResult, app: &mut AppState) 
             invoice: Some(invoice.clone()),
             body: None,
             maker_bond_publish: order.status == Some(mostro_core::order::Status::WaitingMakerBond),
+            solver_pubkey: None,
+            dispute_id: None,
         };
 
         let invoice_state = InvoiceInputState {
@@ -309,13 +311,25 @@ pub fn handle_operation_result(mut result: OperationResult, app: &mut AppState) 
 
     // Handle observer chat results directly (don't show popup)
     match result {
-        OperationResult::ObserverChatLoaded(messages) => {
+        OperationResult::ObserverChatLoaded {
+            generation,
+            messages,
+        } => {
+            if generation != app.observer_fetch_generation {
+                return;
+            }
             app.observer_loading = false;
             app.observer_error = None;
             app.observer_messages = messages;
             return;
         }
-        OperationResult::ObserverChatError(msg) => {
+        OperationResult::ObserverChatError {
+            generation,
+            message: msg,
+        } => {
+            if generation != app.observer_fetch_generation {
+                return;
+            }
             app.observer_loading = false;
             app.observer_error = Some(msg.clone());
             app.mode = UiMode::operation_result(OperationResult::Error(msg));
@@ -375,9 +389,12 @@ pub fn handle_operation_result(mut result: OperationResult, app: &mut AppState) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::orders::OrderChatStaticHeader;
+    use crate::ui::orders::{
+        order_message_to_notification, OrderChatStaticHeader, OrderMessage, TakeOrderState,
+    };
     use crate::ui::{FormState, UserRole};
-    use mostro_core::prelude::{SmallOrder, Status};
+    use mostro_core::prelude::{Message, Payload, SmallOrder, Status};
+    use nostr_sdk::prelude::Keys;
 
     #[test]
     fn failed_new_order_keeps_form_draft() {
@@ -480,6 +497,8 @@ mod tests {
                     trade_index: 1,
                     initiator_trade_pubkey: "pk".to_string(),
                     is_mine: true,
+                    solver_pubkey: None,
+                    dispute_id: None,
                 },
                 action: Action::PayBondInvoice,
             },
@@ -488,5 +507,141 @@ mod tests {
 
         assert!(app.order_form_draft.is_none());
         assert!(matches!(app.mode, UiMode::NewMessageNotification(_, _, _)));
+    }
+
+    #[test]
+    fn take_add_invoice_from_waiting_opens_invoice_popup_not_created_success() {
+        let mut app = AppState::new(UserRole::User);
+        let order_id = uuid::Uuid::new_v4();
+        app.mode = UiMode::UserMode(UserMode::WaitingTakeOrder(TakeOrderState {
+            order: SmallOrder {
+                id: Some(order_id),
+                kind: Some(mostro_core::order::Kind::Sell),
+                ..Default::default()
+            },
+            amount_input: "100".to_string(),
+            is_range_order: true,
+            validation_error: None,
+            selected_button: true,
+        }));
+
+        let sender = Keys::generate().public_key();
+        let message = Message::new_order(
+            Some(order_id),
+            Some(1),
+            Some(2),
+            Action::AddInvoice,
+            Some(Payload::Order(SmallOrder {
+                id: Some(order_id),
+                kind: Some(mostro_core::order::Kind::Sell),
+                status: Some(Status::WaitingBuyerInvoice),
+                ..Default::default()
+            })),
+        );
+        let order_message = OrderMessage {
+            message,
+            timestamp: 1,
+            sender,
+            order_id: Some(order_id),
+            trade_index: 2,
+            sat_amount: Some(21_000),
+            buyer_invoice: None,
+            order_kind: Some(mostro_core::order::Kind::Sell),
+            is_mine: Some(false),
+            order_status: Some(Status::WaitingBuyerInvoice),
+            order_snapshot: None,
+            read: true,
+            auto_popup_shown: true,
+        };
+        let notification = order_message_to_notification(&order_message);
+
+        handle_operation_result(
+            OperationResult::OpenInvoicePopup {
+                notification,
+                order_message: Box::new(order_message),
+            },
+            &mut app,
+        );
+
+        match &app.mode {
+            UiMode::NewMessageNotification(n, action, _) => {
+                assert_eq!(*action, Action::AddInvoice);
+                assert_eq!(n.order_id, Some(order_id));
+            }
+            other => panic!("expected AddInvoice popup, got {other:?}"),
+        }
+        assert!(
+            !matches!(app.mode, UiMode::OperationResult(_)),
+            "take AddInvoice must not show the create-order success overlay"
+        );
+    }
+
+    #[test]
+    fn stale_observer_chat_loaded_does_not_replace_newer_or_cleared_state() {
+        use crate::ui::chat::{ChatSender, DisputeChatMessage};
+
+        let dummy = |content: &str| DisputeChatMessage {
+            sender: ChatSender::Buyer,
+            content: content.to_string(),
+            timestamp: 1,
+            target_party: None,
+            attachment: None,
+        };
+
+        let mut app = AppState::new(UserRole::Admin);
+        let gen_a = app.begin_observer_fetch();
+        app.clear_observer_secrets();
+        handle_operation_result(
+            OperationResult::ObserverChatLoaded {
+                generation: gen_a,
+                messages: vec![dummy("from-a")],
+            },
+            &mut app,
+        );
+        assert!(
+            app.observer_messages.is_empty(),
+            "cleared Observer must ignore the late fetch for the previous K_conv"
+        );
+
+        let gen_b = app.begin_observer_fetch();
+        handle_operation_result(
+            OperationResult::ObserverChatLoaded {
+                generation: gen_a,
+                messages: vec![dummy("from-a")],
+            },
+            &mut app,
+        );
+        assert!(
+            app.observer_messages.is_empty(),
+            "in-flight B must not be overwritten by late A"
+        );
+        assert!(app.observer_loading);
+
+        handle_operation_result(
+            OperationResult::ObserverChatLoaded {
+                generation: gen_b,
+                messages: vec![dummy("from-b")],
+            },
+            &mut app,
+        );
+        assert_eq!(app.observer_messages.len(), 1);
+        assert_eq!(app.observer_messages[0].content, "from-b");
+        assert!(!app.observer_loading);
+    }
+
+    #[test]
+    fn stale_observer_chat_error_does_not_raise_popup() {
+        let mut app = AppState::new(UserRole::Admin);
+        let gen_a = app.begin_observer_fetch();
+        app.clear_observer_secrets();
+        handle_operation_result(
+            OperationResult::ObserverChatError {
+                generation: gen_a,
+                message: "relay timeout".into(),
+            },
+            &mut app,
+        );
+        assert!(app.observer_error.is_none());
+        assert!(!matches!(app.mode, UiMode::OperationResult(_)));
     }
 }

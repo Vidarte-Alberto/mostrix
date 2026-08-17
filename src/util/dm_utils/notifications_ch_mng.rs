@@ -207,12 +207,38 @@ fn invoice_popup_mode(
     }
 }
 
+/// Remember the execute-path row so a later listener copy of the same DM does not
+/// auto-popup again (`auto_popup_shown`), and My Trades has a sidebar entry.
+fn remember_open_invoice_order_message(app: &mut AppState, order_message: &OrderMessage) {
+    let Some(order_id) = order_message.order_id else {
+        return;
+    };
+    let mut messages = match app.messages.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            crate::util::request_fatal_restart(format!(
+                "Mostrix encountered an internal error (poisoned messages lock: {e}). Please restart the app."
+            ));
+            return;
+        }
+    };
+    if let Some(existing) = messages.iter_mut().find(|m| m.order_id == Some(order_id)) {
+        existing.auto_popup_shown = true;
+        return;
+    }
+    let mut stored = order_message.clone();
+    stored.auto_popup_shown = true;
+    messages.push(stored);
+    messages.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
+}
+
 /// Apply invoice or waiting-phase popup after a synchronous protocol reply (bond payout, etc.).
 pub fn apply_open_invoice_popup_from_execute(
     app: &mut AppState,
     notification: MessageNotification,
     order_message: &OrderMessage,
 ) {
+    remember_open_invoice_order_message(app, order_message);
     let gate_action = match notification.action {
         Action::WaitingBuyerInvoice | Action::WaitingSellerToPay => Action::AddInvoice,
         ref other => other.clone(),
@@ -243,6 +269,17 @@ pub fn apply_open_invoice_popup_from_execute(
 
 /// Handle message notification from the notification channel
 pub fn handle_message_notification(notification: MessageNotification, app: &mut AppState) {
+    if let Some(order_id) = notification.order_id {
+        if let Some(header) = app.order_chat_static.get_mut(&order_id) {
+            if notification.solver_pubkey.is_some() {
+                header.solver_pubkey.clone_from(&notification.solver_pubkey);
+            }
+            if notification.dispute_id.is_some() {
+                header.dispute_id.clone_from(&notification.dispute_id);
+            }
+        }
+    }
+
     // Only show popup automatically for PayInvoice / PayBondInvoice / AddInvoice,
     // and only if we haven't already shown it for this message.
     match notification.action {
@@ -282,5 +319,79 @@ pub fn handle_message_notification(notification: MessageNotification, app: &mut 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_message_notification;
+    use crate::ui::{AppState, MessageNotification, OrderChatStaticHeader, UserRole};
+    use mostro_core::prelude::{Action, Kind};
+    use uuid::Uuid;
+
+    fn notification(
+        order_id: Uuid,
+        action: Action,
+        solver_pubkey: Option<&str>,
+        dispute_id: Option<&str>,
+    ) -> MessageNotification {
+        MessageNotification {
+            order_id: Some(order_id),
+            message_preview: String::new(),
+            timestamp: 1,
+            action,
+            sat_amount: None,
+            invoice: None,
+            body: None,
+            maker_bond_publish: false,
+            solver_pubkey: solver_pubkey.map(str::to_string),
+            dispute_id: dispute_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn dispute_metadata_survives_later_notifications() {
+        let order_id = Uuid::new_v4();
+        let mut app = AppState::new(UserRole::User);
+        app.order_chat_static.insert(
+            order_id,
+            OrderChatStaticHeader {
+                order_id,
+                kind: Some(Kind::Buy),
+                created_at: None,
+                trade_index: 1,
+                initiator_trade_pubkey: "initiator".to_string(),
+                is_mine: false,
+                solver_pubkey: None,
+                dispute_id: None,
+            },
+        );
+
+        handle_message_notification(
+            notification(
+                order_id,
+                Action::DisputeInitiatedByYou,
+                None,
+                Some("dispute-id"),
+            ),
+            &mut app,
+        );
+        handle_message_notification(
+            notification(
+                order_id,
+                Action::AdminTookDispute,
+                Some("solver-pubkey"),
+                None,
+            ),
+            &mut app,
+        );
+        handle_message_notification(
+            notification(order_id, Action::FiatSent, None, None),
+            &mut app,
+        );
+
+        let header = app.order_chat_static.get(&order_id).expect("static header");
+        assert_eq!(header.dispute_id.as_deref(), Some("dispute-id"));
+        assert_eq!(header.solver_pubkey.as_deref(), Some("solver-pubkey"));
     }
 }

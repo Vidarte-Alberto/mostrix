@@ -23,7 +23,12 @@ pub struct AppState {
     pub active_tab: Tab,
     /// Orders tab selection by order UUID (currency-filtered; see helpers/order_selection.rs).
     pub selected_order_id: Option<Uuid>,
-    pub selected_dispute_idx: usize, // Disputes Pending (Initiated) list index
+    /// Persistent scroll state for the Orders tab table.
+    pub orders_table_state: TableState,
+    /// Disputes Pending selection by dispute UUID (initiated projection; see dispute_selection.rs).
+    pub selected_pending_dispute_id: Option<Uuid>,
+    /// Persistent scroll state for the Disputes Pending table.
+    pub disputes_table_state: TableState,
     /// Disputes In Progress / Finalized selection is by **dispute id**, not a raw
     /// index into `admin_disputes_in_progress` (see `helpers/dispute_selection.rs`).
     pub selected_dispute_id: Option<String>,
@@ -77,17 +82,17 @@ Mostrix supports two distinct roles, each with its own set of tabs and workflows
 
 Focused on trading and order management.
 
-- **Orders**: View the global order book (stateful table scrolls with ↑↓ when the book is taller than the terminal; optional vertical scrollbar).
+- **Orders**: View the global order book (persistent `TableState` scrolls with ↑↓; shared vertical scrollbar confined to data rows).
 - **My Trades**: Manage active trades.
 - **Messages**: Direct messages for trade coordination.
-- **Settings**: Local configuration, including key rotation via **Generate New Keys** and mnemonic backup prompts. **User mode only**: **Set Lightning Address (buyer)** / **Clear Lightning Address** — optional `user@domain.com` stored in `settings.toml`; confirm-save fetches LNURL metadata (`payRequest`) before persisting (see `src/util/ln_address.rs`, `spawn_verify_and_save_ln_address_task`). The visible menu and **Enter** routing share **`ADMIN_SETTINGS`** / **`USER_SETTINGS`** in `src/ui/tabs/settings_tab.rs` (`SettingsMenuAction` + label per row; **`settings_action_for_index`**).
+- **Settings**: Local configuration. **User mode**: key rotation via **Generate New Keys** and mnemonic backup prompts; **Set Lightning Address (buyer)** / **Clear Lightning Address** — optional `user@domain.com` stored in `settings.toml`; confirm-save fetches LNURL metadata (`payRequest`) before persisting (see `src/util/ln_address.rs`, `spawn_verify_and_save_ln_address_task`). **Admin mode**: **Change Admin Key** / **Add Dispute Solver** (no Generate New Keys — admin must use the Mostro daemon nsec). The visible menu and **Enter** routing share **`ADMIN_SETTINGS`** / **`USER_SETTINGS`** in `src/ui/tabs/settings_tab.rs` (`SettingsMenuAction` + label per row; **`settings_action_for_index`**).
 - **Create New Order**: Sectioned order form with live preview, searchable currency picker (instance `fiat_currencies_accepted` or bundled ISO list), and silent draft persistence when switching tabs.
 
 ### Admin Role
 
 Focused on dispute resolution and protocol management.
 
-- **Disputes Pending**: List of disputes waiting to be taken. Only displays disputes with `Initiated` status (filtering implemented in `disputes_tab.rs`). Admins can select and take ownership of these disputes.
+- **Disputes Pending**: List of disputes waiting to be taken (`Initiated` only via `get_initiated_disputes`). Selection by dispute UUID (`selected_pending_dispute_id` + `dispute_selection.rs`); persistent `disputes_table_state` + shared scrollbar (same pattern as Orders). Admins take ownership with Enter.
 - **Disputes in Progress**: Complete workspace for managing taken disputes (state: `InProgress`), featuring:
   - Integrated chat system with buyer and seller
   - Comprehensive dispute information header
@@ -97,17 +102,18 @@ Focused on dispute resolution and protocol management.
   - **Scrollable sidebar list** (`List` + `ListState`): ↑↓ keeps the selected dispute in view when many disputes overflow the sidebar; scrollbar when the list is taller than the panel
   - Finalization popup for resolution actions
   - **Empty state**: When no disputes are available, displays helpful key hints footer (filter + `↑↓: Select Dispute | Ctrl+H: Help`); footer is width-aware (narrow terminals show only Ctrl+H).
-- **Observer**: Read-only workspace for inspecting user-to-user encrypted chats via a shared key:
-  - Single shared-key input (64-char hex secret, paste-friendly)
-  - Fetches NIP-59 gift-wrap messages from relays for the last 7 days using the shared key's public key
+- **Observer**: Read-only workspace for inspecting user-to-user encrypted chats via disclosed **`K_conv`**:
+  - `K_conv` input (64-char hex secret, paste-friendly) plus optional `pub(K_sign)` locator
+  - Fetches kind-14 chat events from relays for the last 7 days (`authors` when locator present, else `#p = pub(K_conv)`)
   - Decrypts messages and maps sender pubkeys to Buyer/Seller/Admin roles automatically
   - Displays chat using the same formatting as the dispute chat (color-coded, right-aligned Buyer/Seller, left-aligned Admin)
   - Supports file/image attachments with `Ctrl+S` to save (same popup as dispute chat)
-  - Keyboard hints: `Enter` to fetch chat, `Ctrl+C` to clear all, `Ctrl+S` to save attachment, `Ctrl+H` for help
+  - Keyboard hints: `Tab` switches `K_conv` / `pub(K_sign)`, `Enter` to fetch chat, `Ctrl+C` to clear all, `Ctrl+S` to save attachment, `Ctrl+H` for help
 - **Settings**: Role-specific configuration including:
   - Add Dispute Solver
-  - Generate New Keys (rotates the Admin keypair)
+  - Change Admin Key (set `admin_privkey` to the Mostro daemon nsec)
   - Manage relays and currency filters
+  - (**User mode**) Generate New Keys / Lightning address options
 
 For detailed information about admin dispute resolution workflows, see [ADMIN_DISPUTES.md](ADMIN_DISPUTES.md) and [FINALIZE_DISPUTES.md](FINALIZE_DISPUTES.md).
 
@@ -148,7 +154,7 @@ The primary shared popup is the **operation result** modal, used for:
 - Order creation / take-order flows
 - Settings validation errors (invalid pubkey, relay, currency, Lightning address format, LNURL verification failure, etc.)
 - Admin actions (add solver, finalize disputes)
-- Blossom attachment downloads and Observer-mode shared-key errors
+- Blossom attachment downloads and Observer-mode `K_conv` errors
 
 When the popup is closed (**Esc** or **Enter**) from the **Disputes in Progress** tab, the app stays on that tab and returns to **ManagingDispute** mode (it does not switch to the first tab).
 
@@ -186,7 +192,7 @@ if let UiMode::OperationResult(result) = &app.mode {
 **Help popup (Ctrl+H)**:
 
 - **Open**: Press **Ctrl+H** in normal or managing-dispute mode to show a context-aware shortcuts overlay for the current tab (Disputes in Progress, Observer, Settings, Orders, etc.).
-- **Content**: The popup lists all relevant key bindings for that tab; e.g. in Disputes in Progress it shows filter toggle, Tab/Enter/Shift+I/Shift+F, scroll keys, and Ctrl+S to open the save-attachment list when applicable. On **My Trades** it includes PgUp/PgDn/End chat scroll, **Ctrl+S** (save attachment list), **Ctrl+O** (send file picker), and **Ctrl+Shift+O** (retry DM after upload ok / send failed).
+- **Content**: The popup lists all relevant key bindings for that tab; e.g. in Disputes in Progress it shows filter toggle, Tab/Enter/Shift+I/Shift+F, scroll keys, and Ctrl+S to open the save-attachment list when applicable. On **My Trades** it includes PgUp/PgDn/End chat scroll, **Shift+K** (reveal `K_conv` for solvers), **Ctrl+S** (save attachment list), **Ctrl+O** (send file picker), and **Ctrl+Shift+O** (retry DM after upload ok / send failed). On **Observer**, Tab switches `K_conv` / `pub(K_sign)` (Left/Right still change tabs).
 - **Close**: **Esc**, **Enter**, or **Ctrl+H** close the popup; other keys are absorbed while it is open.
 - **Source**: `src/ui/help_popup.rs` (rendering), `src/ui/key_handler/mod.rs` (Ctrl+H and close handling).
 
@@ -252,7 +258,7 @@ The `handle_key_event` function dispatches keys based on the current `UiMode`.
 - **Paste support**: The event loop now centralizes paste routing for active inputs and supports:
   - `Event::Paste(...)` (bracketed paste)
   - mouse right-click paste (`MouseEventKind::Down(MouseButton::Right)`) using clipboard read fallback
-  This applies to invoice input, admin key/solver inputs, and observer shared-key input.
+  This applies to invoice input, admin key/solver inputs, and Observer `K_conv` / `pub(K_sign)` fields.
 - **Admin Chat**: `handle_admin_chat_input` handles direct text input in the "Disputes in Progress" tab:
   - Takes priority over other input handling (except invoice and key input)
   - Supports direct character input and backspace
@@ -270,9 +276,10 @@ The `handle_key_event` function dispatches keys based on the current `UiMode`.
 
 Renders a table of pending orders from the Mostro network. Status and order kinds are color-coded for readability.
 
-- **Scrolling**: uses a stateful [`Table`](https://docs.rs/ratatui) + `TableState` so ↑↓ keeps the selected row in view when the order book is taller than the terminal (same idea as the Messages sidebar / Disputes In Progress list). A vertical scrollbar appears when row count exceeds the visible body height.
+- **Scrolling**: persistent [`TableState`](https://docs.rs/ratatui) on `AppState.orders_table_state` so ↑↓ keeps the selected row in view without resetting the viewport each frame (aligned with Disputes Pending). A vertical scrollbar from `render_table_list_scrollbar` appears when row count exceeds the visible body; thumb tracks viewport **offset** and stays on the data-row track (does not overwrite borders/header).
 - **Selection by order id** (`selected_order_id` + `helpers/order_selection.rs`): ↑↓ / highlight / Enter all resolve through the same currency-filtered book projection. If the stored id is hidden by `currencies_filter`, selection falls back to the first visible row so take/cancel never targets a filtered-out order. Survives book reorders better than a raw list index.
 - **Narrow terminals** (`width < 100`): compact column set (Kind / Fiat Amt / Premium / Payment) — Premium stays visible.
+- **Short terminals** (`height < 4`): header row is dropped so at least one data row remains visible.
 
 **Source**: `src/ui/tabs/orders_tab.rs`, `src/ui/helpers/order_selection.rs`
 
@@ -388,6 +395,7 @@ The My Trades workspace (`src/ui/tabs/order_in_progress_tab.rs`) now shows riche
   - **Shift+F** mark fiat sent (YES/NO popup).
   - **Shift+R** release sats (YES/NO popup).
   - **Shift+V** rate counterparty (opens 1–5 star rating picker).
+  - **Shift+K** reveal `K_conv` (read-only grant for solvers; never the `K_sign` secret).
   - **PgUp/PgDn** scroll chat history; **End** jump to bottom.
   - **Ctrl+S** save attachment (when the selected order has attachments).
   - **Ctrl+O** send attachment (file picker); **Ctrl+Shift+O** retry DM when a prepared send is pending.
@@ -414,9 +422,9 @@ Mostrix uses a consistent color palette defined in `src/ui/mod.rs`:
 
 ### 5. Admin Chat System
 
-**Status**: ✅ **Fully Implemented (NIP‑59 + Shared Keys)**
+**Status**: ✅ **Fully Implemented (kind 14 + ECDH shared keys)**
 
-The admin chat system in the "Disputes in Progress" tab provides real-time, Nostr-based communication using NIP‑59 gift-wrap events and per‑dispute shared keys derived between the admin key and each party’s trade pubkey.
+The admin chat system in the "Disputes in Progress" tab provides real-time, Nostr-based communication using kind-14 chat envelopes (`K_sign` / `K_conv`, with dual-read of legacy GiftWrap while `CHAT_ACCEPT_LEGACY_GIFTWRAP` is true) and per‑dispute ECDH shared keys derived between the admin key and each party’s trade pubkey.
 
 #### Helper module organization (readability refactor)
 
@@ -488,29 +496,29 @@ The key handler processes input in this order:
 
 **Source**: `src/ui/key_handler/mod.rs` (`handle_admin_chat_input`, Shift+I toggle).
 
-#### NIP‑59 Chat Internals (Shared Key Model)
+#### Kind-14 Chat Internals (Shared Key Model)
+
+Active admin-chat transport is kind 14 (`K_sign` / `K_conv`). GiftWrap is inbound-only during the `CHAT_ACCEPT_LEGACY_GIFTWRAP` dual-read window, not the send path.
 
 - **Shared key derivation**:
-  - When a dispute is taken (`AdminDispute::new`), per-party shared keys are eagerly derived using ECDH: `nostr_sdk::util::generate_shared_key(admin_secret, counterparty_pubkey)`.
-  - Two shared keys are stored (as hex) in the `admin_disputes` table: `buyer_shared_key_hex` and `seller_shared_key_hex`.
-  - The same derivation is used by `mostro-chat` so both the admin and the counterparty can independently derive the same shared key and subscribe to the same events.
+  - When a dispute is taken (`AdminDispute::new`), per-party ECDH shared secrets are eagerly derived (`derive_shared_key_hex`) and stored as hex in `buyer_shared_key_hex` / `seller_shared_key_hex`. Chat wrap/unwrap derives `K_conv` / `K_sign` from that IKM at runtime.
+  - Both admin and counterparty can independently derive the same ECDH secret (and thus the same chat keys), matching mostro-chat.
 
 - **Message addressing**:
-  - Admin chat messages are addressed to the **shared key's public key** (not the counterparty's trade pubkey directly).
-  - The admin reads `admin_privkey` from `settings.toml` to sign the inner rumor; the gift wrap `p` tag targets the shared key pubkey.
+  - Outbound chat is kind 14 signed by `K_sign` with `p` = `pub(K_conv)` (derived from stored ECDH hex). The admin identity signs the inner rumor.
 
 - **Sending messages**:
   - Admin messages are sent via `send_admin_chat_message_via_shared_key` (spawned as an async task to avoid blocking the UI):
-    - Rumor content: Mostro protocol format `(Message::Dm(SendDm, TextMessage(...)), None)`.
-    - The gift wrap is built using `EventBuilder::gift_wrap` with the admin keys and the shared key public key as the recipient.
+    - Inner event is a kind-1 text note signed by the admin key.
+    - Outer envelope is always kind 14 (`wrap_chat_message`); GiftWrap is receive-only during the dual-read window.
     - Published to relays without blocking the main UI thread.
 
 - **Receiving messages**:
-  - The shared-key chat subscription router (`listen_for_chat_messages`) delivers messages live over one batched `kind: 1059` subscription; disputes are tracked via `track_dispute_chat` when taken and re-tracked by `track_startup_chats` at startup/reconnect. History is hydrated once per key on track.
+  - The shared-key chat subscription router (`listen_for_chat_messages`) delivers messages live over a batched subscription (kind 14 always; GiftWrap while `CHAT_ACCEPT_LEGACY_GIFTWRAP` is true). Disputes are tracked via `track_dispute_chat` when taken (with a party+admin inner-signer allow-list) and re-tracked by `track_startup_chats` at startup/reconnect. History is hydrated once per key on track.
   - For each in-progress dispute, the fetch:
     - Rebuilds buyer/seller shared `Keys` from the stored hex.
-    - Fetches `GiftWrap` events addressed to each shared key's public key (7-day rolling window).
-    - Decrypts each event using the shared key (standard NIP-59 or simplified mostro-chat format).
+    - Fetches history with kind-14 `authors = [pub(K_sign)]`, plus a legacy `kind: 1059` `#p` query while dual-read is on (7-day rolling window; GiftWrap `created_at` is randomized so that query keeps the wide floor).
+    - Decrypts each event using the shared key (`K_conv` / `K_sign`) and rejects inner signers outside the party+admin allow-list.
     - Uses `last_seen_timestamp` to skip already-processed events.
     - Skips events signed by the admin identity to avoid duplicating locally-sent messages.
 
@@ -527,7 +535,7 @@ The key handler processes input in this order:
       - Rebuilds `AppState.admin_dispute_chats` so the Disputes in Progress tab immediately shows previous messages.
       - Computes the latest timestamps per party and updates `AppState.admin_chat_last_seen`.
     - The latest buyer/seller timestamps are also persisted in the `admin_disputes` table (`buyer_chat_last_seen`, `seller_chat_last_seen`) via `update_chat_last_seen_by_dispute_id` so that:
-      - Background NIP‑59 fetches only request **newer** events (7-day rolling window).
+      - Background chat fetches only request **newer** events (7-day rolling window).
       - Chat resumes from where it left off without replaying the full history.
 
 #### Exit Confirmation

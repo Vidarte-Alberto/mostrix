@@ -1,10 +1,10 @@
 pub use crate::shared::permissions::SolverPermission;
 pub use crate::ui::admin_state::AddSolverState;
-pub use crate::ui::app_state::{AppState, UiMode};
+pub use crate::ui::app_state::{AppState, ObserverInputField, UiMode};
 pub use crate::ui::chat::{
     AdminChatLastSeen, AdminChatUpdate, ChatAttachment, ChatAttachmentType, ChatParty, ChatSender,
-    DisputeChatMessage, DisputeFilter, OrderChatLastSeen, OrderChatUpdate, UserChatSender,
-    UserOrderChatMessage,
+    DecodedChatMessage, DisputeChatMessage, DisputeFilter, OrderChatLastSeen, OrderChatUpdate,
+    UserChatChannel, UserChatSender, UserOrderChatMessage,
 };
 pub use crate::ui::navigation::{AdminTab, Tab, UserRole, UserTab};
 pub use crate::ui::orders::{

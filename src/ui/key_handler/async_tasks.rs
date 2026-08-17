@@ -19,7 +19,7 @@ use crate::util::{
     OrderDmSubscriptionCmd, StartupDmHydration,
 };
 use mostro_core::prelude::{Dispute, SmallOrder, Transport};
-use nostr_sdk::prelude::{Client, Keys, PublicKey};
+use nostr_sdk::prelude::{Client, Keys, PublicKey, SignerAuthenticator};
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use std::{
     env, fs,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -253,7 +253,9 @@ pub async fn apply_pending_key_reload(
     match load_settings_from_disk() {
         Ok(latest_settings) => match latest_settings.nsec_privkey.parse::<Keys>() {
             Ok(new_identity_keys) => {
-                let new_client = Client::new(new_identity_keys);
+                let new_client = Client::builder()
+                    .authenticator(SignerAuthenticator::new(new_identity_keys.clone()))
+                    .build();
                 let mut reload_error: Option<String> = None;
                 for relay in &latest_settings.relays {
                     let relay = relay.trim();
@@ -444,7 +446,25 @@ pub async fn apply_pending_fetch_scheduler_reload(
     message_listener_handle.abort();
     order_fetch_task.abort();
     dispute_fetch_task.abort();
-    client.unsubscribe_all().await;
+    match client.unsubscribe_all().await {
+        Ok(output) if !output.failed.is_empty() => {
+            let failed: Vec<String> = output
+                .failed
+                .iter()
+                .map(|(url, err)| format!("{url}: {err}"))
+                .collect();
+            return Err(format!(
+                "Fetch scheduler reload: unsubscribe_all failed on relays: {}",
+                failed.join("; ")
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!(
+                "Fetch scheduler reload: unsubscribe_all failed: {e}"
+            ));
+        }
+    }
 
     connect_client_safely(client)
         .await
@@ -619,7 +639,23 @@ pub async fn reload_runtime_session_after_reconnect(
     ctx.message_listener_handle.abort();
     ctx.order_fetch_task.abort();
     ctx.dispute_fetch_task.abort();
-    ctx.client.unsubscribe_all().await;
+    match ctx.client.unsubscribe_all().await {
+        Ok(output) if !output.failed.is_empty() => {
+            let failed: Vec<String> = output
+                .failed
+                .iter()
+                .map(|(url, err)| format!("{url}: {err}"))
+                .collect();
+            return Err(format!(
+                "Reconnect: unsubscribe_all failed on relays: {}",
+                failed.join("; ")
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Reconnect: unsubscribe_all failed: {e}"));
+        }
+    }
 
     connect_client_safely(ctx.client)
         .await
@@ -730,8 +766,8 @@ pub async fn respawn_chat_listener(
     pool: &SqlitePool,
     chat_listener_handle: &mut JoinHandle<()>,
     chat_router_cmd_tx: &mut UnboundedSender<ChatRouterCmd>,
-    admin_chat_updates_tx: &UnboundedSender<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
-    user_order_chat_updates_tx: &UnboundedSender<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
+    admin_chat_updates_tx: &Sender<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
+    user_order_chat_updates_tx: &Sender<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
 ) -> Result<(), String> {
     chat_listener_handle.abort();
     // Await the old task so it releases its subscription/state before the new one starts.
@@ -766,10 +802,10 @@ pub struct AppChannels {
     pub seed_words_rx: UnboundedReceiver<Result<Zeroizing<String>, String>>,
     pub message_notification_tx: UnboundedSender<MessageNotification>,
     pub message_notification_rx: UnboundedReceiver<MessageNotification>,
-    pub admin_chat_updates_tx: UnboundedSender<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
-    pub admin_chat_updates_rx: UnboundedReceiver<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
-    pub user_order_chat_updates_tx: UnboundedSender<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
-    pub user_order_chat_updates_rx: UnboundedReceiver<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
+    pub admin_chat_updates_tx: Sender<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
+    pub admin_chat_updates_rx: Receiver<Result<Vec<AdminChatUpdate>, anyhow::Error>>,
+    pub user_order_chat_updates_tx: Sender<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
+    pub user_order_chat_updates_rx: Receiver<Result<Vec<OrderChatUpdate>, anyhow::Error>>,
     pub save_attachment_tx: UnboundedSender<(String, ChatAttachment)>,
     pub save_attachment_rx: UnboundedReceiver<(String, ChatAttachment)>,
     pub send_order_attachment_tx: UnboundedSender<crate::util::SendOrderAttachmentJob>,
@@ -798,9 +834,13 @@ pub fn create_app_channels() -> AppChannels {
     let (message_notification_tx, message_notification_rx) =
         tokio::sync::mpsc::unbounded_channel::<MessageNotification>();
     let (admin_chat_updates_tx, admin_chat_updates_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<Vec<AdminChatUpdate>, anyhow::Error>>();
+        tokio::sync::mpsc::channel::<Result<Vec<AdminChatUpdate>, anyhow::Error>>(
+            crate::util::chat_security::CHAT_UPDATE_CAPACITY,
+        );
     let (user_order_chat_updates_tx, user_order_chat_updates_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<Vec<OrderChatUpdate>, anyhow::Error>>();
+        tokio::sync::mpsc::channel::<Result<Vec<OrderChatUpdate>, anyhow::Error>>(
+            crate::util::chat_security::CHAT_UPDATE_CAPACITY,
+        );
     let (save_attachment_tx, save_attachment_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, ChatAttachment)>();
     let (send_order_attachment_tx, send_order_attachment_rx) =
@@ -1062,6 +1102,9 @@ pub fn spawn_refresh_mostro_info_task(
     });
 }
 
+/// Rotate the **user** identity (mnemonic + `nsec_privkey`). Admin key changes
+/// must use **Change Admin Key** with the Mostro daemon nsec — do not pass
+/// `is_user_mode = false` (that path is rejected).
 pub fn spawn_key_rotation_task(
     pool: SqlitePool,
     is_user_mode: bool,
@@ -1071,55 +1114,54 @@ pub fn spawn_key_rotation_task(
 ) {
     tokio::spawn(async move {
         let rotation_result: Result<(), anyhow::Error> = async {
-            if is_user_mode {
-                let new_user = User::from_mnemonic(mnemonic.clone())?;
-                let mut tx = pool.begin().await?;
-                User::replace_all_in_tx(&new_user, &mut tx).await?;
-                Order::delete_all_in_tx(&mut tx).await?;
-                log::info!("User key rotation: cleared orders table (stale trade keys)");
+            if !is_user_mode {
+                return Err(anyhow::anyhow!(
+                    "Admin key rotation via Generate New Keys is disabled; use Change Admin Key"
+                ));
+            }
 
-                let mut s = crate::settings::load_settings_from_disk()?;
-                s.nsec_privkey = derived_nsec.clone();
-                let toml_string = toml::to_string_pretty(&s)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize settings: {}", e))?;
+            let new_user = User::from_mnemonic(mnemonic.clone())?;
+            let mut tx = pool.begin().await?;
+            User::replace_all_in_tx(&new_user, &mut tx).await?;
+            Order::delete_all_in_tx(&mut tx).await?;
+            log::info!("User key rotation: cleared orders table (stale trade keys)");
 
-                let home_dir = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-                let package_name = env!("CARGO_PKG_NAME");
-                let hidden_file_path = home_dir
-                    .join(format!(".{package_name}"))
-                    .join("settings.toml");
-                let executable_file_path = env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|dir| dir.join("settings.toml")));
-                let target_settings_file = executable_file_path
-                    .filter(|p| p.exists())
-                    .unwrap_or(hidden_file_path);
+            let mut s = crate::settings::load_settings_from_disk()?;
+            s.nsec_privkey = derived_nsec.clone();
+            let toml_string = toml::to_string_pretty(&s)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize settings: {}", e))?;
 
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let tmp_path = target_settings_file.with_extension(format!("tmp-{}", nanos));
-                fs::write(&tmp_path, toml_string).map_err(|e| {
-                    anyhow::anyhow!("Failed to write temporary settings file: {}", e)
-                })?;
+            let home_dir =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            let package_name = env!("CARGO_PKG_NAME");
+            let hidden_file_path = home_dir
+                .join(format!(".{package_name}"))
+                .join("settings.toml");
+            let executable_file_path = env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|dir| dir.join("settings.toml")));
+            let target_settings_file = executable_file_path
+                .filter(|p| p.exists())
+                .unwrap_or(hidden_file_path);
 
-                if let Err(e) = tx.commit().await {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(anyhow::anyhow!("Failed to commit user update: {}", e));
-                }
-                if let Err(e) = fs::rename(&tmp_path, &target_settings_file) {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(anyhow::anyhow!(
-                        "Failed to atomically replace settings: {}",
-                        e
-                    ));
-                }
-            } else {
-                let mut s = crate::settings::load_settings_from_disk()?;
-                s.admin_privkey = derived_nsec.clone();
-                crate::settings::save_settings(&s)?;
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let tmp_path = target_settings_file.with_extension(format!("tmp-{}", nanos));
+            fs::write(&tmp_path, toml_string)
+                .map_err(|e| anyhow::anyhow!("Failed to write temporary settings file: {}", e))?;
+
+            if let Err(e) = tx.commit().await {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(anyhow::anyhow!("Failed to commit user update: {}", e));
+            }
+            if let Err(e) = fs::rename(&tmp_path, &target_settings_file) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(anyhow::anyhow!(
+                    "Failed to atomically replace settings: {}",
+                    e
+                ));
             }
             Ok(())
         }

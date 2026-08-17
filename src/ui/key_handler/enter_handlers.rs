@@ -2,8 +2,8 @@ use crate::models::{Order, ORDER_HISTORY_BULK_DELETE_STATUSES};
 use crate::shared::permissions::SolverPermission;
 use crate::ui::admin_state::AddSolverState;
 use crate::ui::helpers::{
-    build_active_order_chat_list, save_order_chat_message, selected_filtered_book_order,
-    selected_filtered_dispute,
+    build_active_order_chat_list, save_order_chat_message, save_user_dispute_chat_message,
+    selected_filtered_book_order, selected_filtered_dispute, selected_pending_dispute,
 };
 use crate::ui::key_handler::chat_helpers::{
     build_order_action_view_state, handle_enter_finalize_popup, message_counter,
@@ -20,7 +20,8 @@ use crate::ui::orders::{
 use crate::ui::{
     order_message_to_notification, AdminMode, AdminTab, AppState, ChatParty, InvoiceInputState,
     InvoiceNotificationActionSelection, MessageViewState, OperationResult, RatingOrderState, Tab,
-    TakeOrderState, ThreeState, UiMode, UserMode, UserRole, UserTab, ViewingMessageButtonSelection,
+    TakeOrderState, ThreeState, UiMode, UserChatChannel, UserChatSender, UserMode,
+    UserOrderChatMessage, UserRole, UserTab, ViewingMessageButtonSelection,
 };
 // User handlers moved to user_handlers.rs
 use crate::ui::key_handler::async_tasks::{
@@ -33,9 +34,9 @@ use crate::ui::key_handler::user_handlers::{
 };
 use bip39::Mnemonic;
 use mostro_core::prelude::*;
-use nostr_sdk::nips::nip06::FromMnemonic;
+use nostr_sdk::prelude::FromMnemonic;
+use nostr_sdk::prelude::ToBech32;
 use nostr_sdk::prelude::{Keys, PublicKey, SecretKey};
-use nostr_sdk::ToBech32;
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -56,9 +57,13 @@ use crate::ui::key_handler::settings::{
     validate_ln_address_format,
 };
 use crate::ui::key_handler::validation::{
-    validate_currency, validate_mostro_pubkey, validate_relay,
+    normalize_mostro_pubkey, validate_currency, validate_relay,
 };
 use crate::ui::tabs::settings_tab::{settings_action_for_index, SettingsMenuAction};
+use crate::util::chat_utils::{
+    derive_shared_keys, fetch_observer_chat, keys_from_shared_hex, observer_known_signer_roles,
+    send_user_order_chat_message_via_shared_key,
+};
 use crate::util::dm_utils::{apply_saved_ln_address_invoice_choice, present_add_invoice_popup};
 use crate::util::order_utils::BondSlashChoice;
 
@@ -99,6 +104,7 @@ struct DisputeChatTarget {
 #[derive(Clone)]
 struct OrderChatTarget {
     order_id: String,
+    channel: UserChatChannel,
 }
 
 struct EnterChatSendConfig {
@@ -117,7 +123,7 @@ fn run_enter_chat_send_flow<T, ResolveTarget, ApplyLocal, SpawnRemote, ResetInpu
     reset_input: ResetInput,
 ) where
     ResolveTarget: FnOnce(&mut AppState) -> Option<T>,
-    ApplyLocal: FnOnce(&mut AppState, &T, &str),
+    ApplyLocal: FnOnce(&mut AppState, &T, &str) -> bool,
     SpawnRemote: FnOnce(T, String),
     ResetInput: FnOnce(&mut AppState),
 {
@@ -136,7 +142,9 @@ fn run_enter_chat_send_flow<T, ResolveTarget, ApplyLocal, SpawnRemote, ResetInpu
         return;
     };
 
-    apply_local(app, &target, &content);
+    if !apply_local(app, &target, &content) {
+        return;
+    }
     reset_input(app);
     app.mode = mode_after_send;
     spawn_remote(target, content);
@@ -157,19 +165,56 @@ fn resolve_selected_order_chat_target(app: &AppState) -> Option<OrderChatTarget>
         .get(app.selected_order_chat_idx)
         .map(|row| OrderChatTarget {
             order_id: row.order_id.clone(),
+            channel: app.active_user_chat_channel,
         })
+}
+
+fn persist_local_user_chat_message(
+    app: &mut AppState,
+    target: &OrderChatTarget,
+    local_msg: UserOrderChatMessage,
+) -> bool {
+    let persisted = match target.channel {
+        UserChatChannel::Peer => save_order_chat_message(&target.order_id, &local_msg),
+        UserChatChannel::Solver => save_user_dispute_chat_message(&target.order_id, &local_msg),
+    };
+    if !persisted {
+        app.mode = UiMode::operation_result(OperationResult::Error(format!(
+            "Failed to save {channel} chat message locally. The message was not sent.",
+            channel = target.channel
+        )));
+        return false;
+    }
+
+    match target.channel {
+        UserChatChannel::Peer => {
+            app.order_chats
+                .entry(target.order_id.clone())
+                .or_default()
+                .push(local_msg);
+        }
+        UserChatChannel::Solver => {
+            app.user_dispute_chats
+                .entry(target.order_id.clone())
+                .or_default()
+                .push(local_msg);
+        }
+    }
+    scroll_order_chat_after_send(app, &target.order_id, target.channel);
+    true
 }
 
 fn spawn_user_order_chat_send_task(
     ctx: &super::EnterKeyContext<'_>,
     order_id: String,
+    channel: UserChatChannel,
     content: String,
 ) {
     let client = ctx.client.clone();
     let pool = ctx.pool.clone();
     let mostro_info = ctx.mostro_info.clone();
     tokio::spawn(async move {
-        let order = match crate::models::Order::get_by_id(&pool, &order_id).await {
+        let order = match Order::get_by_id(&pool, &order_id).await {
             Ok(o) => o,
             Err(e) => {
                 log::warn!("order chat send skipped (order not found): {}", e);
@@ -185,19 +230,30 @@ fn spawn_user_order_chat_send_task(
             None => return,
         };
         let trade_keys = Keys::new(trade_sk);
-        let shared_keys = order
-            .order_chat_shared_key_hex
-            .as_deref()
-            .and_then(crate::util::chat_utils::keys_from_shared_hex)
-            .or_else(|| {
-                let cp = order.counterparty_pubkey.as_deref()?;
-                let pk = PublicKey::parse(cp).ok()?;
-                crate::util::chat_utils::derive_shared_keys(Some(&trade_keys), Some(&pk))
-            });
+        let shared_keys = match channel {
+            UserChatChannel::Peer => order
+                .order_chat_shared_key_hex
+                .as_deref()
+                .and_then(keys_from_shared_hex)
+                .or_else(|| {
+                    let cp = order.counterparty_pubkey.as_deref()?;
+                    let pk = PublicKey::parse(cp).ok()?;
+                    derive_shared_keys(Some(&trade_keys), Some(&pk))
+                }),
+            UserChatChannel::Solver => order
+                .dispute_chat_shared_key_hex
+                .as_deref()
+                .and_then(keys_from_shared_hex)
+                .or_else(|| {
+                    let solver = order.solver_pubkey.as_deref()?;
+                    let pk = PublicKey::parse(solver).ok()?;
+                    derive_shared_keys(Some(&trade_keys), Some(&pk))
+                }),
+        };
         let Some(shared_keys) = shared_keys else {
             return;
         };
-        if let Err(e) = crate::util::chat_utils::send_user_order_chat_message_via_shared_key(
+        if let Err(e) = send_user_order_chat_message_via_shared_key(
             &client,
             &trade_keys,
             &shared_keys,
@@ -206,7 +262,7 @@ fn spawn_user_order_chat_send_task(
         )
         .await
         {
-            log::warn!("Failed to send user order chat: {}", e);
+            log::warn!("Failed to send user {channel} chat: {e}");
         }
     });
 }
@@ -316,6 +372,7 @@ fn handle_enter_admin_managing_dispute_chat(app: &mut AppState, ctx: &super::Ent
         |app, target, content| {
             prepare_admin_chat_message(&target.dispute_id_key, content, app);
             message_counter(app, &target.dispute_id_key);
+            true
         },
         |target, content| {
             send_admin_chat_message_via_shared_key(
@@ -347,21 +404,16 @@ fn handle_enter_user_order_chat(app: &mut AppState, ctx: &super::EnterKeyContext
         },
         |app| resolve_selected_order_chat_target(app),
         |app, target, content| {
-            let local_msg = crate::ui::UserOrderChatMessage {
-                sender: crate::ui::UserChatSender::You,
+            let local_msg = UserOrderChatMessage {
+                sender: UserChatSender::You,
                 content: content.to_string(),
                 timestamp: chrono::Utc::now().timestamp(),
                 attachment: None,
             };
-            app.order_chats
-                .entry(target.order_id.clone())
-                .or_default()
-                .push(local_msg.clone());
-            save_order_chat_message(&target.order_id, &local_msg);
-            scroll_order_chat_after_send(app, &target.order_id);
+            persist_local_user_chat_message(app, target, local_msg)
         },
         |target, content| {
-            spawn_user_order_chat_send_task(ctx, target.order_id, content);
+            spawn_user_order_chat_send_task(ctx, target.order_id, target.channel, content);
         },
         |app| {
             app.order_chat_input.clear();
@@ -574,6 +626,14 @@ pub fn handle_enter_key(app: &mut AppState, ctx: &super::EnterKeyContext<'_>) ->
                 return true;
             }
 
+            // Admin Settings no longer offers Generate New Keys; refuse if reached somehow.
+            if matches!(app.user_role, UserRole::Admin) {
+                app.mode = UiMode::operation_result(OperationResult::Error(
+                    "Generate New Keys is User-mode only. Use Change Admin Key to set the Mostro daemon nsec.".to_string(),
+                ));
+                return true;
+            }
+
             // YES: generate mnemonic + derived key, persist in background, then show backup popup.
             let mnemonic = match generate_mnemonic_12_words() {
                 Ok(m) => m,
@@ -597,13 +657,11 @@ pub fn handle_enter_key(app: &mut AppState, ctx: &super::EnterKeyContext<'_>) ->
                 }
             };
 
-            let is_user_mode = matches!(app.user_role, UserRole::User);
-
             // Persist rotation asynchronously to avoid UI blocking; backup popup
             // will be shown only after successful commit via key_rotation_rx in main.
             spawn_key_rotation_task(
                 ctx.pool.clone(),
-                is_user_mode,
+                true, // user mode only
                 mnemonic.clone(),
                 derived_nsec,
                 ctx.key_rotation_tx.clone(),
@@ -752,7 +810,10 @@ pub fn handle_enter_key(app: &mut AppState, ctx: &super::EnterKeyContext<'_>) ->
     }
 }
 
-/// Handle Enter key for settings-related modes (Mostro pubkey, relay, currency, etc.)
+/// Handle Enter key for settings-related modes (Mostro pubkey, relay, currency, etc.).
+///
+/// Mostro pubkey input accepts npub or hex; [`normalize_mostro_pubkey`] converts to hex
+/// before the confirmation dialog so settings persistence stays hex-encoded.
 fn handle_enter_settings_mode(
     app: &mut AppState,
     mode: UiMode,
@@ -761,13 +822,12 @@ fn handle_enter_settings_mode(
 ) -> bool {
     match mode {
         UiMode::AddMostroPubkey(key_state) => {
-            // Validate Mostro pubkey (hex format) before proceeding to confirmation
-            match validate_mostro_pubkey(&key_state.key_input) {
-                Ok(_) => {
-                    app.mode =
-                        handle_input_to_confirmation(&key_state.key_input, default_mode, |input| {
-                            UiMode::ConfirmMostroPubkey(input, true)
-                        });
+            // Accept npub or hex; normalize to hex before confirmation (settings store hex).
+            match normalize_mostro_pubkey(&key_state.key_input) {
+                Ok(normalized) => {
+                    app.mode = handle_input_to_confirmation(&normalized, default_mode, |input| {
+                        UiMode::ConfirmMostroPubkey(input, true)
+                    });
                 }
                 Err(e) => {
                     // Show error popup
@@ -1017,20 +1077,7 @@ fn handle_enter_normal_mode(app: &mut AppState, ctx: &super::EnterKeyContext<'_>
                 return;
             }
         };
-        // Filter to only get "initiated" disputes
-        let initiated_disputes: Vec<(usize, &Dispute)> = disputes_lock
-            .iter()
-            .enumerate()
-            .filter(|(_, dispute)| {
-                DisputeStatus::from_str(dispute.status.as_str())
-                    .map(|s| s == DisputeStatus::Initiated)
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if let Some((_original_idx, dispute)) = initiated_disputes.get(app.selected_dispute_idx) {
-            // Only allow taking disputes with "Initiated" status
-            // (We already filtered, so this should always be true)
+        if let Some(dispute) = selected_pending_dispute(app, &disputes_lock) {
             app.mode = UiMode::AdminMode(AdminMode::ConfirmTakeDispute(dispute.id, true));
             // Default to YES
         }
@@ -1161,48 +1208,56 @@ fn handle_enter_normal_mode(app: &mut AppState, ctx: &super::EnterKeyContext<'_>
             }
         }
     } else if let Tab::Admin(AdminTab::Observer) = app.active_tab {
-        // Validate and trigger async fetch for observer chat via shared key
+        // Validate K_conv, then fetch observer chat authenticated against
+        // known admin/party inner signers from taken disputes.
         let key_str = app.observer_shared_key_input.trim().to_string();
         if key_str.is_empty() {
-            let msg = "Shared key is required".to_string();
+            let msg = "K_conv is required".to_string();
             app.observer_error = Some(msg.clone());
             app.mode = UiMode::operation_result(OperationResult::Error(msg));
             return;
         }
 
         if crate::util::chat_utils::keys_from_shared_hex(&key_str).is_none() {
-            let msg = "Shared key must be a valid 64-char hex secret (32 bytes)".to_string();
+            let msg = "K_conv must be a valid 64-char hex secret (32 bytes)".to_string();
             app.observer_error = Some(msg.clone());
             app.mode = UiMode::operation_result(OperationResult::Error(msg));
             return;
         }
 
-        // Clear previous results and set loading state
-        for msg in &mut app.observer_messages {
-            zeroize::Zeroize::zeroize(&mut msg.content);
-        }
-        app.observer_messages.clear();
-        app.observer_error = None;
-        app.observer_loading = true;
+        let sign_pubkey = match crate::util::chat_utils::parse_optional_sign_pubkey(
+            &app.observer_sign_pubkey_input,
+        ) {
+            Ok(pk) => pk,
+            Err(e) => {
+                let msg = e.to_string();
+                app.observer_error = Some(msg.clone());
+                app.mode = UiMode::operation_result(OperationResult::Error(msg));
+                return;
+            }
+        };
 
         // Spawn async fetch via the order_result channel
+        let generation = app.begin_observer_fetch();
         let client = ctx.client.clone();
         let admin_pubkey = ctx.admin_chat_keys.map(|k| k.public_key());
+        let known_roles =
+            observer_known_signer_roles(admin_pubkey.as_ref(), &app.admin_disputes_in_progress);
         let tx = ctx.order_result_tx.clone();
 
         tokio::spawn(async move {
-            match crate::util::chat_utils::fetch_observer_chat(
-                &client,
-                &key_str,
-                admin_pubkey.as_ref(),
-            )
-            .await
-            {
+            match fetch_observer_chat(&client, &key_str, sign_pubkey, &known_roles).await {
                 Ok(messages) => {
-                    let _ = tx.send(OperationResult::ObserverChatLoaded(messages));
+                    let _ = tx.send(OperationResult::ObserverChatLoaded {
+                        generation,
+                        messages,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(OperationResult::ObserverChatError(e.to_string()));
+                    let _ = tx.send(OperationResult::ObserverChatError {
+                        generation,
+                        message: e.to_string(),
+                    });
                 }
             }
         });
@@ -1256,5 +1311,74 @@ fn handle_enter_normal_mode(app: &mut AppState, ctx: &super::EnterKeyContext<'_>
             }
             None => {}
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        persist_local_user_chat_message, run_enter_chat_send_flow, EnterChatSendConfig,
+        OrderChatTarget,
+    };
+    use crate::ui::{
+        AppState, OperationResult, UiMode, UserChatChannel, UserChatSender, UserOrderChatMessage,
+        UserRole,
+    };
+    use std::cell::Cell;
+
+    #[test]
+    fn failed_user_chat_persistence_keeps_input_and_aborts_send() {
+        for channel in [UserChatChannel::Peer, UserChatChannel::Solver] {
+            let mut app = AppState::new(UserRole::User);
+            app.order_chat_input = "retry me".to_string();
+            let remote_spawned = Cell::new(false);
+            let input_reset = Cell::new(false);
+            let mode_after_send = app.mode.clone();
+
+            run_enter_chat_send_flow(
+                &mut app,
+                EnterChatSendConfig {
+                    mode_after_send,
+                    input_enabled: true,
+                    content: "retry me".to_string(),
+                },
+                |_| {
+                    Some(OrderChatTarget {
+                        order_id: "invalid-order-id".to_string(),
+                        channel,
+                    })
+                },
+                |app, target, content| {
+                    persist_local_user_chat_message(
+                        app,
+                        target,
+                        UserOrderChatMessage {
+                            sender: UserChatSender::You,
+                            content: content.to_string(),
+                            timestamp: 1,
+                            attachment: None,
+                        },
+                    )
+                },
+                |_, _| remote_spawned.set(true),
+                |app| {
+                    input_reset.set(true);
+                    app.order_chat_input.clear();
+                },
+            );
+
+            assert_eq!(app.order_chat_input, "retry me");
+            assert!(!input_reset.get());
+            assert!(!remote_spawned.get());
+            assert!(app.order_chats.is_empty());
+            assert!(app.user_dispute_chats.is_empty());
+            let UiMode::OperationResult(result) = &app.mode else {
+                panic!("storage failure should show an operation error");
+            };
+            assert!(matches!(
+                result.as_ref(),
+                OperationResult::Error(message) if message.contains("message was not sent")
+            ));
+        }
     }
 }

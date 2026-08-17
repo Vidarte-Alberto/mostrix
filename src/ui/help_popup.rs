@@ -7,10 +7,18 @@ use super::constants::*;
 use super::{AppState, DisputeFilter, BACKGROUND_COLOR, PRIMARY_COLOR};
 use crate::ui::navigation::{AdminTab, Tab, UserRole, UserTab};
 
+// 13 shortcuts, intro, close hint, borders, and one row of margin above and below.
+const MY_TRADES_FULL_HELP_MIN_HEIGHT: u16 = 19;
+const MY_TRADES_FULL_HELP_MIN_WIDTH: u16 = 60;
+
 /// Renders the context-aware keyboard shortcuts popup (Ctrl+H, and Shift+H on My Trades).
 pub fn render_help_popup(f: &mut ratatui::Frame, app: &AppState, tab: Tab) {
     let area = f.area();
     let (title, plain_lines) = help_content(app, tab);
+    let narrow_my_trades =
+        matches!(tab, Tab::User(UserTab::MyTrades)) && area.width < MY_TRADES_FULL_HELP_MIN_WIDTH;
+    let compact_my_trades = matches!(tab, Tab::User(UserTab::MyTrades))
+        && (area.height < MY_TRADES_FULL_HELP_MIN_HEIGHT || narrow_my_trades);
 
     // Match Settings Shift+H: compact rows, styled shortcut + description, full viewport height.
     let compact_chrome = matches!(
@@ -56,11 +64,15 @@ pub fn render_help_popup(f: &mut ratatui::Frame, app: &AppState, tab: Tab) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if matches!(tab, Tab::Admin(AdminTab::DisputesInProgress)) {
             lines.push(help_disputes_in_progress_intro());
+        } else if compact_my_trades {
+            lines.extend(compact_my_trades_help(narrow_my_trades));
         } else {
             lines.push(help_my_trades_intro());
         }
-        for s in plain_lines {
-            lines.push(help_shortcut_line(&s));
+        if !compact_my_trades {
+            for s in plain_lines {
+                lines.push(help_shortcut_line(&s));
+            }
         }
         lines.push(Line::from(Span::styled(
             HELP_CLOSE_HINT,
@@ -179,6 +191,31 @@ fn help_my_trades_intro() -> Line<'static> {
     ])
 }
 
+fn compact_my_trades_help(narrow: bool) -> Vec<Line<'static>> {
+    if narrow {
+        let (title_style, _) = settings_instruction_block_style();
+        return [
+            "↑↓  Enter",
+            "Tab  Shift+I",
+            "Shift+C  Shift+F",
+            "Shift+R  Shift+D",
+        ]
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, title_style)))
+        .collect();
+    }
+
+    [
+        "↑↓ / Enter: Select order / send message",
+        "Shift+I / Tab: Toggle input / Peer-Solver chat",
+        "Shift+C / Shift+F: Cancel order / mark fiat sent",
+        "Shift+R / Shift+D: Release sats / open dispute",
+    ]
+    .into_iter()
+    .map(help_shortcut_line)
+    .collect()
+}
+
 /// Split `Key: description` help strings into bold key + gray body (same as Settings Shift+H rows).
 fn help_shortcut_line(s: &str) -> Line<'static> {
     let (title_style, body_style) = settings_instruction_block_style();
@@ -218,7 +255,7 @@ fn settings_instruction_lines(user_role: UserRole) -> (String, Vec<Line<'static>
         ),
         (
             "Change Mostro Pubkey",
-            "Set the Mostro daemon hex pubkey used for subscriptions and orders.",
+            "Set the Mostro daemon pubkey (npub or hex) used for subscriptions and orders.",
         ),
         (
             "Add Nostr Relay",
@@ -242,11 +279,7 @@ fn settings_instruction_lines(user_role: UserRole) -> (String, Vec<Line<'static>
         ),
         (
             "Change Admin Key",
-            "Update admin_privkey in settings (dispute chat and classification).",
-        ),
-        (
-            "Generate New Keys",
-            "Rotate identity/trade keys. Confirm prompts and back up any new mnemonic.",
+            "Set admin_privkey to the Mostro daemon nsec (operator actions + dispute chat).",
         ),
     ];
 
@@ -257,7 +290,7 @@ fn settings_instruction_lines(user_role: UserRole) -> (String, Vec<Line<'static>
         ),
         (
             "Change Mostro Pubkey",
-            "Set the Mostro daemon hex pubkey used for subscriptions and orders.",
+            "Set the Mostro daemon pubkey (npub or hex) used for subscriptions and orders.",
         ),
         (
             "Add Nostr Relay",
@@ -336,6 +369,7 @@ fn help_content(app: &AppState, tab: Tab) -> (String, Vec<String>) {
             HELP_TITLE_OBSERVER.to_string(),
             vec![
                 HELP_OBS_ENTER_LOAD.to_string(),
+                HELP_OBS_TAB_FOCUS.to_string(),
                 HELP_OBS_PASTE_SHARED_KEY.to_string(),
                 HELP_OBS_SCROLL_LINE.to_string(),
                 HELP_OBS_SCROLL_PAGE.to_string(),
@@ -369,12 +403,14 @@ fn help_content(app: &AppState, tab: Tab) -> (String, Vec<String>) {
             vec![
                 HELP_MY_TRADES_NAV.to_string(),
                 HELP_MY_TRADES_ENTER_SEND.to_string(),
+                HELP_MY_TRADES_TAB_CHAT.to_string(),
                 HELP_MY_TRADES_SHIFT_I.to_string(),
                 HELP_MY_TRADES_SHIFT_C_CANCEL.to_string(),
                 HELP_MY_TRADES_SHIFT_F_FIAT_SENT.to_string(),
                 HELP_MY_TRADES_SHIFT_R_RELEASE.to_string(),
                 HELP_MY_TRADES_SHIFT_V_RATE.to_string(),
                 HELP_MY_TRADES_SHIFT_D_DISPUTE.to_string(),
+                HELP_MY_TRADES_SHIFT_K_KCONV.to_string(),
                 HELP_MY_TRADES_CTRL_S_ATTACH.to_string(),
                 HELP_MY_TRADES_CTRL_O_SEND.to_string(),
                 HELP_MY_TRADES_CTRL_SHIFT_O_RETRY.to_string(),
@@ -416,6 +452,19 @@ fn help_content(app: &AppState, tab: Tab) -> (String, Vec<String>) {
 #[cfg(test)]
 mod help_content_tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        let mut flat = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                flat.push_str(buf[(x, y)].symbol());
+            }
+            flat.push('\n');
+        }
+        flat.contains(needle)
+    }
 
     #[test]
     fn my_trades_help_lists_the_dispute_shortcut() {
@@ -425,5 +474,80 @@ mod help_content_tests {
             lines.iter().any(|l| l == HELP_MY_TRADES_SHIFT_D_DISPUTE),
             "Shift+D missing from My Trades help: {lines:?}"
         );
+        assert!(
+            lines.iter().any(|l| l == HELP_MY_TRADES_SHIFT_K_KCONV),
+            "Shift+K missing from My Trades help: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn observer_help_lists_k_conv_load_and_tab_focus() {
+        let app = AppState::new(UserRole::Admin);
+        let (_, lines) = help_content(&app, Tab::Admin(AdminTab::Observer));
+        assert!(
+            lines.iter().any(|l| l == HELP_OBS_ENTER_LOAD),
+            "K_conv load missing from Observer help: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == HELP_OBS_TAB_FOCUS),
+            "Tab focus missing from Observer help: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn short_my_trades_help_keeps_essential_shortcuts_and_close_hint_visible() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = AppState::new(UserRole::User);
+
+        terminal
+            .draw(|f| render_help_popup(f, &app, Tab::User(UserTab::MyTrades)))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for expected in [
+            "Enter",
+            "Shift+I",
+            "Tab",
+            "Shift+C",
+            "Shift+F",
+            "Shift+R",
+            "Shift+D",
+            HELP_CLOSE_HINT,
+        ] {
+            assert!(
+                buffer_contains(buf, expected),
+                "missing {expected:?} from compact My Trades help"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_short_my_trades_help_keeps_shortcuts_and_close_hint_visible() {
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = AppState::new(UserRole::User);
+
+        terminal
+            .draw(|f| render_help_popup(f, &app, Tab::User(UserTab::MyTrades)))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for expected in [
+            "Enter",
+            "Tab",
+            "Shift+I",
+            "Shift+C",
+            "Shift+F",
+            "Shift+R",
+            "Shift+D",
+            "Esc, Enter or",
+            "Ctrl+H to close",
+        ] {
+            assert!(
+                buffer_contains(buf, expected),
+                "missing {expected:?} from narrow compact My Trades help"
+            );
+        }
     }
 }

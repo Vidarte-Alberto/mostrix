@@ -1,8 +1,8 @@
-use chrono::DateTime;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListItem;
 
+use crate::ui::helpers::format_local_timestamp;
 use crate::ui::{ChatParty, ChatSender, DisputeChatMessage};
 
 use super::chat_visibility::message_visible_for_party;
@@ -59,13 +59,10 @@ fn format_message_lines(
     msg: &DisputeChatMessage,
     max_content_width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    let (date_str, time_str) = DateTime::from_timestamp(msg.timestamp, 0)
-        .map(|dt| {
-            let date = dt.format("%d-%m-%Y").to_string();
-            let time = dt.format("%H:%M").to_string();
-            (date, time)
-        })
-        .unwrap_or_else(|| ("??-??-????".to_string(), "??:??".to_string()));
+    let date_str = format_local_timestamp(msg.timestamp, "%d-%m-%Y")
+        .unwrap_or_else(|| "??-??-????".to_string());
+    let time_str =
+        format_local_timestamp(msg.timestamp, "%H:%M").unwrap_or_else(|| "??:??".to_string());
 
     let (sender_label, sender_color, is_right_aligned) = match msg.sender {
         ChatSender::Admin => ("Admin", Color::Cyan, false),
@@ -191,7 +188,7 @@ pub fn build_observer_scrollview_content(
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No messages yet. Paste a shared key and press Enter to load.",
+            "No messages yet. Paste K_conv and press Enter to load.",
             Style::default().fg(Color::Gray),
         )));
     }
@@ -202,5 +199,33 @@ pub fn build_observer_scrollview_content(
         content_height,
         content_width,
         line_start_per_message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_observer_scrollview_content;
+
+    #[test]
+    fn observer_empty_hint_asks_for_k_conv_not_ecdh_shared_key() {
+        let content = build_observer_scrollview_content(&[], 40, Some(20));
+        let flat: String = content
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            flat.contains("K_conv"),
+            "empty Observer hint must mention K_conv: {flat}"
+        );
+        assert!(
+            !flat.to_lowercase().contains("shared key"),
+            "empty Observer hint must not say shared key: {flat}"
+        );
     }
 }

@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use futures::StreamExt;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use tokio::task::JoinHandle;
@@ -88,13 +90,16 @@ fn apply_live_dispute_update(disputes: &Arc<Mutex<Vec<Dispute>>>, dispute: Dispu
             return;
         }
     };
+    // Live subscription is `.since(now)` — always take the incoming revision.
+    // Do not compare `dispute.created_at`: after Mostro #878 that field is the
+    // stable open-time tag, not the Nostr publish stamp, so a status update
+    // would otherwise fail to replace when open times are equal (or when a
+    // tagged open time is older than a legacy event-stamp fallback).
     if let Some(existing) = disputes_lock
         .iter_mut()
         .find(|existing| existing.id == dispute.id)
     {
-        if dispute.created_at >= existing.created_at {
-            *existing = dispute;
-        }
+        *existing = dispute;
     } else {
         disputes_lock.push(dispute);
     }
@@ -183,13 +188,13 @@ pub fn spawn_fetch_scheduler_loops(
             };
             let order_filter = Filter::new()
                 .author(mostro_pubkey_for_order_subscribe)
-                .kind(nostr_sdk::Kind::Custom(NOSTR_ORDER_EVENT_KIND))
+                .kind(nostr_sdk::prelude::Kind::Custom(NOSTR_ORDER_EVENT_KIND))
                 .since(Timestamp::now());
-            match client_for_orders.subscribe(order_filter, None).await {
+            match client_for_orders.subscribe(order_filter).await {
                 Ok(output) => {
                     log::debug!(
                         "[orders_live] subscribed to order updates subscription_id={}",
-                        output.val
+                        output.value
                     );
                 }
                 Err(e) => {
@@ -280,15 +285,19 @@ pub fn spawn_fetch_scheduler_loops(
                             );
                         }
                     }
-                    notification = notifications.recv() => {
-                        let Ok(RelayPoolNotification::Event { event, .. }) = notification else {
+                    notification = notifications.next() => {
+                        let Some(notification) = notification else {
+                            log::warn!("[orders_live] notification stream ended");
+                            break;
+                        };
+                        let ClientNotification::Event { event, .. } = notification else {
                             continue;
                         };
                         let event = *event;
-                        if event.kind != nostr_sdk::Kind::Custom(NOSTR_ORDER_EVENT_KIND) {
+                        if event.kind != nostr_sdk::prelude::Kind::Custom(NOSTR_ORDER_EVENT_KIND) {
                             continue;
                         }
-                        let mut one = Events::default();
+                        let mut one = BTreeSet::new();
                         one.insert(event);
                         let latest_live = aggregate_latest_orders_by_id(&one);
                         for relay_order in latest_live.values() {
@@ -330,13 +339,13 @@ pub fn spawn_fetch_scheduler_loops(
                 };
             let dispute_filter = Filter::new()
                 .author(mostro_pubkey_for_dispute_subscribe)
-                .kind(nostr_sdk::Kind::Custom(NOSTR_DISPUTE_EVENT_KIND))
+                .kind(nostr_sdk::prelude::Kind::Custom(NOSTR_DISPUTE_EVENT_KIND))
                 .since(Timestamp::now());
-            match client_for_disputes.subscribe(dispute_filter, None).await {
+            match client_for_disputes.subscribe(dispute_filter).await {
                 Ok(output) => {
                     log::debug!(
                         "[disputes_live] subscribed to dispute updates subscription_id={}",
-                        output.val
+                        output.value
                     );
                 }
                 Err(e) => {
@@ -382,15 +391,19 @@ pub fn spawn_fetch_scheduler_loops(
                             );
                         }
                     }
-                    notification = notifications.recv() => {
-                        let Ok(RelayPoolNotification::Event { event, .. }) = notification else {
+                    notification = notifications.next() => {
+                        let Some(notification) = notification else {
+                            log::warn!("[disputes_live] notification stream ended");
+                            break;
+                        };
+                        let ClientNotification::Event { event, .. } = notification else {
                             continue;
                         };
                         let event = *event;
-                        if event.kind != nostr_sdk::Kind::Custom(NOSTR_DISPUTE_EVENT_KIND) {
+                        if event.kind != nostr_sdk::prelude::Kind::Custom(NOSTR_DISPUTE_EVENT_KIND) {
                             continue;
                         }
-                        let mut one = Events::default();
+                        let mut one = BTreeSet::new();
                         one.insert(event);
                         let mut parsed = super::parse_disputes_events(one);
                         log::debug!(

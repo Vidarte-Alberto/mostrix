@@ -16,12 +16,12 @@ Where `X` is the index:
 
 ## Key Rotation and Backup Prompts
 
-The Settings tab includes a **Generate New Keys** option (User mode or Admin mode, depending on the current role).
+The Settings tab includes a **Generate New Keys** option in **User mode** only.
 
 - **User mode**: Mostrix generates a new 12-word mnemonic, deletes/recreates the DB user identity, and updates `settings.toml`’s `nsec_privkey`.
-- **Admin mode**: Mostrix rotates the admin keypair and updates `settings.toml`’s `admin_privkey`.
+- **Admin mode**: use **Change Admin Key** to paste the Mostro daemon `nsec` into `admin_privkey`. Generating a new admin keypair is not offered — operator actions (e.g. `AdminAddSolver`) require the daemon’s own key.
 
-In both cases Mostrix shows a backup popup displaying the newly generated 12 words. The mnemonic must be saved, and Mostrix should be restarted after saving so all derived keys and in-memory state use the new values.
+In the user-mode flow Mostrix shows a backup popup displaying the newly generated 12 words. The mnemonic must be saved, and Mostrix should be restarted after saving so all derived keys and in-memory state use the new values.
 
 On very first launch, when Mostrix must bootstrap a brand-new `settings.toml`, it also shows the backup popup as an overlay on the initial Orders/Disputes tab (it does not force switching to the Settings tab).
 
@@ -54,8 +54,8 @@ In admin mode, Mostrix also uses **per‑dispute shared keys** for the dispute c
 
 - **Usage**:
   - The shared keys act as **per‑(dispute, party) chat identities**:
-    - Outgoing admin chat messages are sent as NIP‑59 `GiftWrap` events addressed to the shared key’s public key.
-    - Incoming messages are fetched by querying `Kind::GiftWrap` events to that same shared key pubkey and decrypting with the shared secret.
+    - Outgoing admin chat messages are kind 14 signed by `K_sign` (`wrap_chat_message`); `p` = `pub(K_conv)`.
+    - Incoming messages are fetched by `authors = [pub(K_sign)]` (kind 14) and, while `CHAT_ACCEPT_LEGACY_GIFTWRAP` is true, also by GiftWrap `#p` = ECDH pubkey.
   - Both admin and counterparty can independently derive the same shared key, mirroring the `mostro-chat` model.
   - Per‑party last‑seen timestamps (`buyer_chat_last_seen`, `seller_chat_last_seen`) are used together with these keys to implement incremental, restart‑safe admin chat sync.
 
@@ -63,7 +63,7 @@ In admin mode, Mostrix also uses **per‑dispute shared keys** for the dispute c
 
 ## NIP-59 Gift Wrap Structure (protocol v1)
 
-Mostrix implements NIP-59 for **protocol v1** and all P2P chat. **Protocol v2** Mostro DMs use signed kind 14 via [`wrap_message_with`](../src/util/mod.rs) — identity proof moves inside the NIP-44 ciphertext (see [MESSAGE_FLOW_AND_PROTOCOL.md](MESSAGE_FLOW_AND_PROTOCOL.md)).
+Mostrix implements NIP-59 for **protocol v1** Mostro DMs. **Protocol v2** Mostro DMs use signed kind 14 via [`wrap_message_with`](../src/util/mod.rs). **P2P / dispute chat** uses kind 14 (`K_sign` / `K_conv`) and dual-reads legacy GiftWrap until `CHAT_ACCEPT_LEGACY_GIFTWRAP` is flipped (see [MESSAGE_FLOW_AND_PROTOCOL.md](MESSAGE_FLOW_AND_PROTOCOL.md)).
 
 ### 1. Normal Mode (Reputation Enabled)
 In this mode, Mostro can link the trade to your identity key for reputation purposes, but other Nostr users cannot.
@@ -132,5 +132,6 @@ Each order entry also stores the specific `trade_keys` (or the index) used, allo
 Mostrix avoids storing full message histories locally. Instead, it uses the deterministic nature of the keys:
 1. On startup, the client retrieves all active order IDs and their associated `trade_index` from the database.
 2. It re-derives the corresponding `Trade Keys`.
-3. It queries Nostr relays for recent `GiftWrap` events (NIP-59) directed to those specific trade public keys.
-4. This allows the client to reconstruct the current state of any active trade without needing a heavy local message database.
+3. It queries Nostr relays for recent **protocol DM** events directed to those trade public keys — GiftWrap (kind 1059) or signed kind 14, depending on the Mostro instance `protocol_version` / [`Transport`](../src/util/mod.rs).
+4. Separately, **P2P / dispute chat** is hydrated by the shared-key chat router (kind 14 `authors = [pub(K_sign)]`, plus legacy GiftWrap `#p` while `CHAT_ACCEPT_LEGACY_GIFTWRAP` is true).
+5. This allows the client to reconstruct the current state of any active trade without needing a heavy local message database.

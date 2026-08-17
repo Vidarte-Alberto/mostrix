@@ -16,7 +16,7 @@ This document provides a comprehensive analysis of the Settings tab features imp
 - **Status Bar Display**: Active relays are displayed in the status bar
 
 ### 3. Key Rotation (Generate New Keys)
-- **Generate New Keys**: Added an option in the Settings tab that rotates the relevant keys for the current role (User mode rotates `nsec_privkey`, Admin mode rotates `admin_privkey`).
+- **Generate New Keys** (**User mode only**): rotates the user mnemonic / `nsec_privkey` and clears local order rows that would reference stale trade keys. Admin mode uses **Change Admin Key** to set `admin_privkey` to the Mostro daemon nsec — generating a fresh admin keypair is intentionally not offered (it would break `AdminAddSolver` and other operator checks).
 - **Safety UX**: Selecting the option shows a warning + confirmation flow, then a backup popup containing the newly generated 12-word mnemonic.
 - **Restart requirement**: After saving the mnemonic, Mostrix must be restarted so the app can use the rotated keys everywhere.
 - **First-launch behavior**: If Mostrix had to bootstrap a brand-new `settings.toml`, the backup popup is shown immediately as an overlay on the initial Orders/Disputes tab (no forced navigation to Settings).
@@ -24,7 +24,7 @@ This document provides a comprehensive analysis of the Settings tab features imp
 ### Blossom servers (`blossom_servers`, optional)
 
 - **Field**: `Settings.blossom_servers` (`Vec<String>`, default empty). Not exposed in the Settings tab UI; edit `settings.toml` directly (see commented example in repo `settings.toml`).
-- **Behavior**: When empty, My Trades attachment **upload** uses `DEFAULT_BLOSSOM_SERVERS` in `src/util/blossom.rs`. When non-empty, `upload_blob_with_retry` tries each HTTPS base in order until one accepts the PUT. Upload authorization (NIP-24242) is signed with the order **trade key** (same identity as the chat GiftWrap), not an ephemeral key.
+- **Behavior**: When empty, My Trades attachment **upload** uses `DEFAULT_BLOSSOM_SERVERS` in `src/util/blossom.rs`. When non-empty, `upload_blob_with_retry` tries each HTTPS base in order until one accepts the PUT. Upload authorization (NIP-24242) is signed with the order **trade key** (same identity that signs the kind-14 chat inner rumor), not an ephemeral key.
 - **Scope**: Used by My Trades outbound send (**Ctrl+O**, `src/util/send_attachment.rs`); receive/save (Ctrl+S) uses the `blossom_url` embedded in each message, not this list.
 
 ### Instance PoW (not a settings field)

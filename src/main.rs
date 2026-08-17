@@ -134,7 +134,7 @@ async fn drain_order_result_queue(
     }
 }
 
-use crate::ui::{AdminMode, AdminTab, AppState, ChatAttachment, Tab, UiMode, UserRole};
+use crate::ui::{AdminMode, AppState, ChatAttachment, UiMode, UserRole};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -209,10 +209,10 @@ fn apply_pasted_text_to_active_input(app: &mut AppState, pasted_text: &str) {
         }
     }
 
-    // Handle paste for observer shared key input
-    if matches!(app.active_tab, Tab::Admin(AdminTab::Observer)) {
+    // Handle paste for the focused Observer field (`K_conv` or `pub(K_sign)`)
+    if app.observer_inputs_editable() {
         let filtered_text: String = pasted_text.chars().filter(|c| !c.is_control()).collect();
-        app.observer_shared_key_input.push_str(&filtered_text);
+        app.observer_active_input_mut().push_str(&filtered_text);
     }
 }
 
@@ -222,7 +222,8 @@ use crate::ui::ui_draw;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Set rustls crypto provider once (required when both ring and aws-lc-rs are in the dependency tree)
+    // Install ring as the rustls crypto provider before any TLS clients are built
+    // (reqwest uses `rustls-no-provider`; without this, Client::new panics).
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("rustls default crypto provider");
@@ -328,7 +329,7 @@ async fn main() -> Result<(), anyhow::Error> {
             dm_subscription_rx,
             chat_router_cmd_rx,
             mostro_info_tx: mostro_info_tx.clone(),
-            network_status_tx,
+            network_status_tx: network_status_tx.clone(),
             message_notification_tx: message_notification_tx.clone(),
             admin_chat_updates_tx: admin_chat_updates_tx.clone(),
             user_order_chat_updates_tx: user_order_chat_updates_tx.clone(),
@@ -362,6 +363,9 @@ async fn main() -> Result<(), anyhow::Error> {
                             ));
                         }
                         crate::ui::NetworkStatus::Online(_msg) => {
+                            // Reachability is back: never keep the offline overlay while TCP works.
+                            // (Reconnect may still fail; we retry below without claiming "offline".)
+                            app.offline_overlay_message = None;
                             // Attempt reconnect + full runtime reload (mirrors key reload path).
                             let latest_settings = crate::settings::load_settings_from_disk()
                                 .unwrap_or_else(|_| settings.clone());
@@ -385,7 +389,6 @@ async fn main() -> Result<(), anyhow::Error> {
                             .await
                             {
                                 Ok(()) => {
-                                    app.offline_overlay_message = None;
                                     // Reconnect ran `unsubscribe_all`; rebuild the chat subscription.
                                     if let Err(e) = respawn_chat_listener(
                                         &app,
@@ -404,9 +407,19 @@ async fn main() -> Result<(), anyhow::Error> {
                                     }
                                 }
                                 Err(e) => {
-                                    app.offline_overlay_message = Some(format!(
-                                        "Reconnect failed: {e}. Retrying every 5 seconds."
-                                    ));
+                                    // Monitor only emits Online on reachability *transitions*, so a
+                                    // failed reconnect while still reachable would never retry and
+                                    // would leave a sticky overlay if we set one here.
+                                    log::error!(
+                                        "Reconnect after network restore failed: {e}. Retrying in 5s."
+                                    );
+                                    let retry_tx = network_status_tx.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                        let _ = retry_tx.send(crate::ui::NetworkStatus::Online(
+                                            "Retrying reconnect".to_string(),
+                                        ));
+                                    });
                                 }
                             }
                         }
@@ -690,11 +703,8 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
 
-        // Ensure the selected dispute index is valid when disputes list changes.
-        // Only count "initiated" disputes since that's what we display
+        // Ensure Pending dispute selection stays valid when the list changes.
         {
-            use mostro_core::prelude::*;
-            use std::str::FromStr;
             let disputes_lock = match disputes.lock() {
                 Ok(g) => g,
                 Err(e) => {
@@ -710,19 +720,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 }
             };
-            let initiated_count = disputes_lock
-                .iter()
-                .filter(|d| {
-                    DisputeStatus::from_str(d.status.as_str())
-                        .map(|s| s == DisputeStatus::Initiated)
-                        .unwrap_or(false)
-                })
-                .count();
-            if initiated_count > 0 && app.selected_dispute_idx >= initiated_count {
-                app.selected_dispute_idx = initiated_count.saturating_sub(1);
-            } else if initiated_count == 0 {
-                app.selected_dispute_idx = 0;
-            }
+            crate::ui::helpers::clamp_pending_dispute_selection(&mut app, &disputes_lock);
         }
 
         // Process async completions before draw so popups appear without extra keypresses.

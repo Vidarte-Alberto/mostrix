@@ -11,13 +11,16 @@ use uuid::Uuid;
 use super::order_chat_projection::order_chat_list_item_from_db_order;
 use crate::models::{AdminDispute, Order, User};
 use crate::ui::{
-    AdminChatLastSeen, AdminChatUpdate, AppState, ChatParty, ChatSender, DisputeChatMessage,
-    OrderChatLastSeen, OrderChatStaticHeader, OrderMessage, UserChatSender, UserOrderChatMessage,
+    AdminChatLastSeen, AdminChatUpdate, AppState, ChatParty, DisputeChatMessage, OrderChatLastSeen,
+    OrderChatStaticHeader, OrderMessage, UserChatChannel, UserChatSender, UserOrderChatMessage,
     UserRole,
 };
 use crate::util::{
-    chat_listener::{track_dispute_chat, track_order_chat},
-    chat_utils::{clamp_chat_since_cursor_now, derive_shared_key_hex},
+    chat_listener::{track_dispute_chat, track_order_chat, track_user_dispute_chat},
+    chat_utils::{
+        clamp_chat_since_cursor_now, derive_shared_key_hex, dispute_chat_allowed_signers,
+        dispute_chat_role_for_inner_signer, order_chat_allowed_signers, parse_chat_pubkey,
+    },
     seed_admin_chat_last_seen,
 };
 
@@ -25,8 +28,13 @@ use super::attachments::{
     build_attachment_toast, legacy_placeholder_matches_filename, try_parse_attachment_message,
 };
 use super::chat_storage::{
-    load_chat_from_file, load_order_chat_from_file, max_party_timestamps, save_chat_message,
-    save_order_chat_message,
+    dispute_chat_inner_id_known, load_chat_from_file, load_order_chat_from_file,
+    load_user_dispute_chat_from_file, max_party_timestamps, order_chat_inner_id_known,
+    remember_dispute_chat_inner_id, remember_order_chat_inner_id,
+    remember_user_dispute_chat_inner_id, rewrite_dispute_chat_messages,
+    rewrite_order_chat_messages, save_chat_message, save_order_chat_message,
+    save_user_dispute_chat_message, user_dispute_chat_inner_id_known,
+    user_dispute_chat_since_from_file,
 };
 
 /// Parse `admin_privkey` text and store in [`AppState::admin_keys`].
@@ -141,7 +149,10 @@ pub async fn load_admin_disputes_at_startup(pool: &SqlitePool, app: &mut AppStat
 /// - **User**: every [`Order::get_startup_active_orders`] row (active states + `success`;
 ///   excludes [`crate::models::TERMINAL_DM_STATUSES`]) with a resolvable shared key —
 ///   persisted `order_chat_shared_key_hex`, else ECDH from `trade_keys` + `counterparty_pubkey`.
-/// - **Admin**: each InProgress dispute's buyer/seller shared key.
+///   Rows without a counterparty trade pubkey are skipped (no inner-signer allow-list).
+/// - **Admin**: each InProgress dispute's buyer/seller shared key, tracked with
+///   that party's trade pubkey plus the admin pubkey when configured. Parties
+///   missing a pubkey are skipped.
 ///
 /// Commands are buffered on the router's channel until the task starts consuming them, so this
 /// is safe to call before the chat router task is spawned. History for each key is hydrated by
@@ -166,18 +177,50 @@ pub async fn track_startup_chats(pool: &SqlitePool, app: &AppState) {
                 let shared_hex = order.order_chat_shared_key_hex.clone().or_else(|| {
                     derive_shared_key_hex(Some(&trade_keys), order.counterparty_pubkey.as_deref())
                 });
-                let Some(shared_hex) = shared_hex else {
-                    continue;
-                };
-                let since = app
-                    .order_chat_last_seen
-                    .get(&row.id)
-                    .and_then(|s| s.last_seen_timestamp)
-                    .map(clamp_chat_since_cursor_now);
-                track_order_chat(row.id.clone(), shared_hex, trade_keys.public_key(), since);
+                if let Some(shared_hex) = shared_hex {
+                    if let Some(allowed) = order_chat_allowed_signers(
+                        trade_keys.public_key(),
+                        order.counterparty_pubkey.as_deref(),
+                    ) {
+                        let since = app
+                            .order_chat_last_seen
+                            .get(&row.id)
+                            .and_then(|s| s.last_seen_timestamp)
+                            .map(clamp_chat_since_cursor_now);
+                        track_order_chat(
+                            row.id.clone(),
+                            shared_hex,
+                            trade_keys.public_key(),
+                            allowed,
+                            since,
+                        );
+                    } else {
+                        log::warn!(
+                            "startup: order {} missing counterparty pubkey; not tracking chat",
+                            row.id
+                        );
+                    }
+                }
+
+                if let (Some(shared_hex), Some(solver)) = (
+                    order.dispute_chat_shared_key_hex.clone(),
+                    order
+                        .solver_pubkey
+                        .as_deref()
+                        .and_then(|value| PublicKey::parse(value).ok()),
+                ) {
+                    track_user_dispute_chat(
+                        row.id.clone(),
+                        shared_hex,
+                        trade_keys.public_key(),
+                        solver,
+                        user_dispute_chat_since_from_file(&row.id),
+                    );
+                }
             }
         }
         UserRole::Admin => {
+            let admin_pk = app.admin_keys.as_ref().map(|k| k.public_key());
             for dispute in &app.admin_disputes_in_progress {
                 let is_in_progress = dispute
                     .status
@@ -187,11 +230,27 @@ pub async fn track_startup_chats(pool: &SqlitePool, app: &AppState) {
                 if !is_in_progress {
                     continue;
                 }
-                for (party, hex) in [
-                    (ChatParty::Buyer, dispute.buyer_shared_key_hex.as_deref()),
-                    (ChatParty::Seller, dispute.seller_shared_key_hex.as_deref()),
+                for (party, hex, party_pk) in [
+                    (
+                        ChatParty::Buyer,
+                        dispute.buyer_shared_key_hex.as_deref(),
+                        dispute.buyer_pubkey.as_deref(),
+                    ),
+                    (
+                        ChatParty::Seller,
+                        dispute.seller_shared_key_hex.as_deref(),
+                        dispute.seller_pubkey.as_deref(),
+                    ),
                 ] {
                     let Some(hex) = hex else {
+                        continue;
+                    };
+                    let Some(allowed) = dispute_chat_allowed_signers(admin_pk.as_ref(), party_pk)
+                    else {
+                        log::warn!(
+                            "startup: dispute {} {party} missing party pubkey; not tracking chat",
+                            dispute.dispute_id
+                        );
                         continue;
                     };
                     let since = app
@@ -199,7 +258,13 @@ pub async fn track_startup_chats(pool: &SqlitePool, app: &AppState) {
                         .get(&(dispute.dispute_id.clone(), party))
                         .and_then(|s| s.last_seen_timestamp)
                         .map(clamp_chat_since_cursor_now);
-                    track_dispute_chat(dispute.dispute_id.clone(), party, hex.to_string(), since);
+                    track_dispute_chat(
+                        dispute.dispute_id.clone(),
+                        party,
+                        hex.to_string(),
+                        allowed,
+                        since,
+                    );
                 }
             }
         }
@@ -226,6 +291,16 @@ pub async fn load_user_order_chats_at_startup(pool: &SqlitePool, app: &mut AppSt
             app.order_chats.insert(order_id.clone(), messages);
             app.order_chat_last_seen.insert(
                 order_id.clone(),
+                OrderChatLastSeen {
+                    last_seen_timestamp: Some(clamp_chat_since_cursor_now(max_ts)),
+                },
+            );
+        }
+        if let Some(messages) = load_user_dispute_chat_from_file(&order_id) {
+            let max_ts = messages.iter().map(|m| m.timestamp).max().unwrap_or(0);
+            app.user_dispute_chats.insert(order_id.clone(), messages);
+            app.user_dispute_chat_last_seen.insert(
+                order_id,
                 OrderChatLastSeen {
                     last_seen_timestamp: Some(clamp_chat_since_cursor_now(max_ts)),
                 },
@@ -347,6 +422,8 @@ fn order_chat_static_from_db_order(row: &Order) -> Option<OrderChatStaticHeader>
         trade_index,
         initiator_trade_pubkey: trade_keys.public_key().to_string(),
         is_mine: row.is_mine,
+        solver_pubkey: row.solver_pubkey.clone(),
+        dispute_id: row.dispute_id.clone(),
     })
 }
 
@@ -397,16 +474,31 @@ pub async fn sync_user_order_history_messages_from_db(pool: &SqlitePool, app: &m
 }
 
 /// Merge fetched user order chat updates into app state and persist them to file.
+///
+/// Durable inner-event ids are recorded only after a successful transcript
+/// [`save_order_chat_message`] / [`rewrite_order_chat_messages`]. On write
+/// failure the id is left unrecorded so a later delivery can retry.
 pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui::OrderChatUpdate>) {
     for update in updates {
         let order_id = update.order_id.clone();
-        let messages_vec = app.order_chats.entry(order_id.clone()).or_default();
-        let mut max_ts = app
-            .order_chat_last_seen
+        let messages_vec = match update.channel {
+            UserChatChannel::Peer => app.order_chats.entry(order_id.clone()).or_default(),
+            UserChatChannel::Solver => app.user_dispute_chats.entry(order_id.clone()).or_default(),
+        };
+        let last_seen_map = match update.channel {
+            UserChatChannel::Peer => &mut app.order_chat_last_seen,
+            UserChatChannel::Solver => &mut app.user_dispute_chat_last_seen,
+        };
+        let mut max_ts = last_seen_map
             .get(&order_id)
             .and_then(|s| s.last_seen_timestamp)
             .unwrap_or(0);
-        for (content, ts, sender_pubkey) in update.messages {
+        for msg in update.messages {
+            let content = msg.content;
+            let ts = msg.timestamp;
+            let sender_pubkey = msg.sender;
+            let inner_id = msg.inner_event_id;
+
             // Skip relay echoes of messages we already added locally on send (mirror admin chat).
             if sender_pubkey == update.local_trade_pubkey {
                 if ts > max_ts {
@@ -415,9 +507,24 @@ pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui:
                 continue;
             }
 
-            let (msg_content, attachment) = match try_parse_attachment_message(&content) {
-                Some((attachment, display)) => (display, Some(attachment)),
-                None => (content.clone(), None),
+            // Durable replay guard: skip if already accepted (do not write again).
+            let inner_id_known = match update.channel {
+                UserChatChannel::Peer => order_chat_inner_id_known(&order_id, &inner_id),
+                UserChatChannel::Solver => user_dispute_chat_inner_id_known(&order_id, &inner_id),
+            };
+            if inner_id_known {
+                if ts > max_ts {
+                    max_ts = ts;
+                }
+                continue;
+            }
+
+            let (msg_content, attachment) = match update.channel {
+                UserChatChannel::Peer => match try_parse_attachment_message(&content) {
+                    Some((attachment, display)) => (display, Some(attachment)),
+                    None => (content.clone(), None),
+                },
+                UserChatChannel::Solver => (content.clone(), None),
             };
 
             if let Some(ref att) = attachment {
@@ -426,13 +533,22 @@ pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui:
                         && m.attachment.is_none()
                         && legacy_placeholder_matches_filename(&m.content, &att.filename)
                 }) {
-                    let sender = messages_vec[idx].sender;
+                    let previous = messages_vec[idx].clone();
+                    let sender = previous.sender;
                     messages_vec[idx] = UserOrderChatMessage {
                         sender,
                         content: msg_content.clone(),
                         timestamp: ts,
                         attachment: Some(att.clone()),
                     };
+                    if !rewrite_order_chat_messages(&order_id, messages_vec) {
+                        messages_vec[idx] = previous;
+                        log::warn!(
+                            "Failed to persist order chat attachment upgrade for {order_id}; leaving inner id unrecorded"
+                        );
+                        continue;
+                    }
+                    let _ = remember_order_chat_inner_id(&order_id, &inner_id);
                     if ts > max_ts {
                         max_ts = ts;
                     }
@@ -463,6 +579,15 @@ pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui:
                 false
             });
             if is_duplicate {
+                // Content already in the transcript; still record the inner id.
+                match update.channel {
+                    UserChatChannel::Peer => {
+                        let _ = remember_order_chat_inner_id(&order_id, &inner_id);
+                    }
+                    UserChatChannel::Solver => {
+                        let _ = remember_user_dispute_chat_inner_id(&order_id, &inner_id);
+                    }
+                }
                 if ts > max_ts {
                     max_ts = ts;
                 }
@@ -479,13 +604,31 @@ pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui:
                 timestamp: ts,
                 attachment,
             };
-            save_order_chat_message(&order_id, &msg);
+            let saved = match update.channel {
+                UserChatChannel::Peer => save_order_chat_message(&order_id, &msg),
+                UserChatChannel::Solver => save_user_dispute_chat_message(&order_id, &msg),
+            };
+            if !saved {
+                log::warn!(
+                    "Failed to persist {} chat message for {order_id}; leaving inner id unrecorded",
+                    update.channel
+                );
+                continue;
+            }
+            match update.channel {
+                UserChatChannel::Peer => {
+                    let _ = remember_order_chat_inner_id(&order_id, &inner_id);
+                }
+                UserChatChannel::Solver => {
+                    let _ = remember_user_dispute_chat_inner_id(&order_id, &inner_id);
+                }
+            }
             messages_vec.push(msg);
             if ts > max_ts {
                 max_ts = ts;
             }
         }
-        app.order_chat_last_seen.insert(
+        last_seen_map.insert(
             order_id,
             OrderChatLastSeen {
                 last_seen_timestamp: Some(clamp_chat_since_cursor_now(max_ts)),
@@ -496,6 +639,12 @@ pub fn apply_user_order_chat_updates(app: &mut AppState, updates: Vec<crate::ui:
 
 /// Apply fetched admin chat updates back into the UI state and persist
 /// last_seen timestamps to the database.
+///
+/// Inner signers that match neither the buyer nor the seller trade pubkey are
+/// dropped (not labeled Admin). Admin echoes are skipped via `admin_chat_pubkey`.
+/// Durable inner-event ids are recorded only after a successful transcript
+/// [`save_chat_message`] / [`rewrite_dispute_chat_messages`]. On write failure
+/// the id is left unrecorded so a later delivery can retry.
 pub async fn apply_admin_chat_updates(
     app: &mut AppState,
     updates: Vec<AdminChatUpdate>,
@@ -516,7 +665,12 @@ pub async fn apply_admin_chat_updates(
             .and_then(|s| s.last_seen_timestamp)
             .unwrap_or(0);
 
-        for (content, ts, sender_pubkey) in update.messages {
+        for msg in update.messages {
+            let content = msg.content;
+            let ts = msg.timestamp;
+            let sender_pubkey = msg.sender;
+            let inner_id = msg.inner_event_id;
+
             if let Some(admin_pk) = admin_chat_pubkey {
                 if &sender_pubkey == admin_pk {
                     if ts > max_ts {
@@ -526,34 +680,41 @@ pub async fn apply_admin_chat_updates(
                 }
             }
 
-            let (sender, target_party) = app
-                .admin_disputes_in_progress
-                .iter()
-                .find(|d| d.dispute_id == dispute_key)
-                .map(|dispute| {
-                    let buyer_pk = dispute
-                        .buyer_pubkey
-                        .as_deref()
-                        .and_then(|s| PublicKey::from_str(s).ok());
-                    let seller_pk = dispute
-                        .seller_pubkey
-                        .as_deref()
-                        .and_then(|s| PublicKey::from_str(s).ok());
-                    if buyer_pk.as_ref() == Some(&sender_pubkey) {
-                        (ChatSender::Buyer, None)
-                    } else if seller_pk.as_ref() == Some(&sender_pubkey) {
-                        (ChatSender::Seller, None)
-                    } else {
-                        (ChatSender::Admin, Some(party))
+            if dispute_chat_inner_id_known(&dispute_key, party, &inner_id) {
+                if ts > max_ts {
+                    max_ts = ts;
+                }
+                continue;
+            }
+
+            let (sender, target_party) = {
+                let dispute = app
+                    .admin_disputes_in_progress
+                    .iter()
+                    .find(|d| d.dispute_id == dispute_key);
+                let buyer_pk = dispute
+                    .and_then(|d| d.buyer_pubkey.as_deref())
+                    .and_then(parse_chat_pubkey);
+                let seller_pk = dispute
+                    .and_then(|d| d.seller_pubkey.as_deref())
+                    .and_then(parse_chat_pubkey);
+                match dispute_chat_role_for_inner_signer(
+                    &sender_pubkey,
+                    buyer_pk.as_ref(),
+                    seller_pk.as_ref(),
+                ) {
+                    Some(role) => role,
+                    None => {
+                        log::warn!(
+                            "dropping dispute {dispute_key} chat message from unknown inner signer"
+                        );
+                        if ts > max_ts {
+                            max_ts = ts;
+                        }
+                        continue;
                     }
-                })
-                .unwrap_or((
-                    match party {
-                        ChatParty::Buyer => ChatSender::Buyer,
-                        ChatParty::Seller => ChatSender::Seller,
-                    },
-                    None,
-                ));
+                }
+            };
 
             let (msg_content, attachment) = match try_parse_attachment_message(&content) {
                 Some((attachment, display)) => (display, Some(attachment)),
@@ -568,6 +729,7 @@ pub async fn apply_admin_chat_updates(
                         && m.attachment.is_none()
                         && legacy_placeholder_matches_filename(&m.content, &att.filename)
                 }) {
+                    let previous = messages_vec[idx].clone();
                     messages_vec[idx] = DisputeChatMessage {
                         sender,
                         content: msg_content.clone(),
@@ -575,6 +737,14 @@ pub async fn apply_admin_chat_updates(
                         target_party,
                         attachment: Some(att.clone()),
                     };
+                    if !rewrite_dispute_chat_messages(&dispute_key, messages_vec) {
+                        messages_vec[idx] = previous;
+                        log::warn!(
+                            "Failed to persist dispute chat attachment upgrade for {dispute_key}; leaving inner id unrecorded"
+                        );
+                        continue;
+                    }
+                    let _ = remember_dispute_chat_inner_id(&dispute_key, party, &inner_id);
                     if ts > max_ts {
                         max_ts = ts;
                     }
@@ -603,6 +773,7 @@ pub async fn apply_admin_chat_updates(
                 false
             });
             if is_duplicate {
+                let _ = remember_dispute_chat_inner_id(&dispute_key, party, &inner_id);
                 if ts > max_ts {
                     max_ts = ts;
                 }
@@ -627,7 +798,13 @@ pub async fn apply_admin_chat_updates(
                 target_party,
                 attachment,
             };
-            save_chat_message(&dispute_key, &msg);
+            if !save_chat_message(&dispute_key, &msg) {
+                log::warn!(
+                    "Failed to persist dispute chat message for {dispute_key}; leaving inner id unrecorded"
+                );
+                continue;
+            }
+            let _ = remember_dispute_chat_inner_id(&dispute_key, party, &inner_id);
             messages_vec.push(msg);
             if ts > max_ts {
                 max_ts = ts;

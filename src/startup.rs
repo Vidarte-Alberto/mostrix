@@ -52,10 +52,10 @@ pub struct PostTerminalStartupInput<'a> {
     pub message_notification_tx: tokio::sync::mpsc::UnboundedSender<crate::ui::MessageNotification>,
     /// Sender used by the chat router to publish decoded admin dispute chat updates.
     pub admin_chat_updates_tx:
-        tokio::sync::mpsc::UnboundedSender<Result<Vec<crate::ui::AdminChatUpdate>, anyhow::Error>>,
+        tokio::sync::mpsc::Sender<Result<Vec<crate::ui::AdminChatUpdate>, anyhow::Error>>,
     /// Sender used by the chat router to publish decoded user order chat updates.
     pub user_order_chat_updates_tx:
-        tokio::sync::mpsc::UnboundedSender<Result<Vec<crate::ui::OrderChatUpdate>, anyhow::Error>>,
+        tokio::sync::mpsc::Sender<Result<Vec<crate::ui::OrderChatUpdate>, anyhow::Error>>,
 }
 
 pub struct StartupBootstrap {
@@ -88,7 +88,9 @@ pub async fn run_post_terminal_startup(
         .nsec_privkey
         .parse::<Keys>()
         .map_err(|e| anyhow::anyhow!("Invalid NSEC privkey: {}", e))?;
-    let client = Client::new(my_keys);
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(my_keys.clone()))
+        .build();
 
     for relay in &input.configured_relays {
         client.add_relay(relay).await?;
@@ -151,6 +153,7 @@ pub async fn run_post_terminal_startup(
     spawn_network_status_monitor(
         input.configured_relays.clone(),
         input.network_status_tx.clone(),
+        relays_reachable,
     );
 
     set_startup_phase(phase_tx, "Restoring chats…");

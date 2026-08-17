@@ -1,6 +1,5 @@
 //! Messages tab: order list sidebar and trade timeline detail panel.
 
-use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -401,8 +400,7 @@ fn render_header_card(f: &mut ratatui::Frame, area: Rect, msg: &OrderMessage) {
         Span::styled(status_emoji.to_string(), Style::default().fg(status_color)),
     ]);
 
-    let absolute = DateTime::<Utc>::from_timestamp(msg.timestamp, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+    let absolute = helpers::format_local_timestamp(msg.timestamp, "%Y-%m-%d %H:%M")
         .unwrap_or_else(|| "unknown".to_string());
     let relative = helpers::relative_time_compact(msg.timestamp);
     let line2 = Line::from(Span::styled(
@@ -798,7 +796,7 @@ fn center_in(text: &str, width: usize) -> String {
 mod sidebar_tests {
     use super::*;
     use mostro_core::prelude::{Action, Message};
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
 
     fn sample_message(read: bool) -> OrderMessage {
         let keys = Keys::generate();
@@ -946,7 +944,7 @@ mod trade_snapshot_tests {
 
     fn message_with(action: mostro_core::prelude::Action, status: Option<Status>) -> OrderMessage {
         use mostro_core::prelude::Message;
-        use nostr_sdk::Keys;
+        use nostr_sdk::prelude::Keys;
         OrderMessage {
             message: Message::new_order(None, None, None, action, None),
             timestamp: 0,
@@ -967,7 +965,7 @@ mod trade_snapshot_tests {
     #[test]
     fn trade_order_snapshot_prefers_stable_field_over_empty_payload() {
         use mostro_core::prelude::{Action, Message, Payload};
-        use nostr_sdk::Keys;
+        use nostr_sdk::prelude::Keys;
         let snap = order(100, None, None);
         let msg = OrderMessage {
             message: Message::new_order(None, None, None, Action::FiatSent, None),
@@ -1044,7 +1042,7 @@ mod trade_snapshot_tests {
 mod layout_and_render_tests {
     use super::*;
     use mostro_core::prelude::{Action, Message, SmallOrder, Status};
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
