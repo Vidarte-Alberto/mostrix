@@ -85,11 +85,8 @@ pub async fn send_new_order(
         Some(form.invoice.trim().to_string())
     };
 
-    // Get user and trade keys
-    let user = User::get(pool).await?;
-    let next_idx = user.last_trade_index.unwrap_or(1) + 1;
-    let trade_keys = user.derive_trade_keys(next_idx)?;
-    let _ = User::update_last_trade_index(pool, next_idx).await;
+    // Reserve the next trade index atomically; propagate DB errors (e.g. SQLITE_BUSY).
+    let (next_idx, trade_keys) = User::reserve_next_trade_index(pool, 1).await?;
 
     // Create SmallOrder
     let small_order = SmallOrder::new(
@@ -248,46 +245,6 @@ pub async fn send_new_order(
                     }
                 } else {
                     Err(anyhow::anyhow!("Mismatched request_id"))
-                }
-            }
-            None if inner_message.action == Action::RateReceived
-                || inner_message.action == Action::NewOrder =>
-            {
-                // Some actions don't require request_id matching
-                if let Some(Payload::Order(order)) = &inner_message.payload {
-                    // Save order to database
-                    if let Err(e) =
-                        save_order(order.clone(), &trade_keys, request_id, next_idx, pool, true)
-                            .await
-                    {
-                        log::error!("Failed to save order to database: {}", e);
-                    }
-                    if let Some(tx) = dm_subscription_tx {
-                        if let Some(order_id) = order.id {
-                            let _ = tx.send(OrderDmSubscriptionCmd::TrackOrder {
-                                order_id,
-                                trade_index: next_idx,
-                            });
-                        }
-                    }
-
-                    Ok(create_order_result_success(
-                        order,
-                        next_idx,
-                        &trade_keys,
-                        true,
-                    ))
-                } else {
-                    log::error!(
-                        "Mostro replied with Action::{:?} but payload is missing/invalid. request_id={:?} trade_index={} payload={:?}",
-                        inner_message.action,
-                        inner_message.request_id,
-                        next_idx,
-                        inner_message.payload
-                    );
-                    Err(anyhow::anyhow!(
-                        "Mostro replied but no order payload was provided"
-                    ))
                 }
             }
             None => Err(anyhow::anyhow!("Response with null request_id")),

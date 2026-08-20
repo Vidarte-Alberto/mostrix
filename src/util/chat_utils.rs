@@ -1058,7 +1058,7 @@ mod tests {
         assert!(event
             .tags
             .public_keys()
-            .any(|pk| *pk == shared.keys().public_key()));
+            .any(|pk| pk == shared.keys().public_key()));
         let decoded = unwrap_giftwrap_chat_message(shared.keys(), &event)
             .await
             .expect("gift wrap decodes");

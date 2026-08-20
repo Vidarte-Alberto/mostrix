@@ -116,14 +116,51 @@ impl User {
         Ok(())
     }
 
+    /// Raise `last_trade_index` to at least `idx` without decreasing the counter.
+    ///
+    /// Prefer [`Self::reserve_next_trade_index`] before starting a trade; trade flows
+    /// already commit the index at reservation time and must not write a stale value
+    /// after a delayed order save.
     pub async fn update_last_trade_index(pool: &SqlitePool, idx: i64) -> Result<()> {
         sqlx::query(
-            r#"UPDATE users SET last_trade_index = ? WHERE i0_pubkey = (SELECT i0_pubkey FROM users LIMIT 1)"#,
+            r#"UPDATE users SET last_trade_index = MAX(COALESCE(last_trade_index, 0), ?) WHERE i0_pubkey = (SELECT i0_pubkey FROM users LIMIT 1)"#,
         )
         .bind(idx)
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically increment `last_trade_index` and derive keys for the new index.
+    ///
+    /// Runs read-modify-write inside a transaction so a failed commit (e.g. `SQLITE_BUSY`)
+    /// surfaces as an error instead of silently reusing an index. `none_base` is the value
+    /// treated as the previous index when `last_trade_index` is NULL (order flows use `1`,
+    /// range-order `NextTrade` uses `0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started, the user row cannot be read,
+    /// the index update fails, or key derivation fails.
+    pub async fn reserve_next_trade_index(
+        pool: &SqlitePool,
+        none_base: i64,
+    ) -> Result<(i64, Keys)> {
+        let mut tx = pool.begin().await?;
+        let user: User = sqlx::query_as(
+            r#"SELECT i0_pubkey, mnemonic, last_trade_index, created_at FROM users LIMIT 1"#,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next_idx = user.last_trade_index.unwrap_or(none_base) + 1;
+        sqlx::query(r#"UPDATE users SET last_trade_index = ? WHERE i0_pubkey = ?"#)
+            .bind(next_idx)
+            .bind(&user.i0_pubkey)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let trade_keys = user.derive_trade_keys(next_idx)?;
+        Ok((next_idx, trade_keys))
     }
 
     pub async fn get_identity_keys(pool: &SqlitePool) -> Result<Keys> {
@@ -388,7 +425,6 @@ impl Order {
         existing: Option<&Order>,
         message_request_id: Option<i64>,
     ) -> Order {
-        let trade_keys_hex = trade_keys.secret_key().to_secret_hex();
         let (counterparty_pubkey, order_chat_shared_key_hex) =
             match crate::util::chat_utils::order_chat_counterparty_and_shared_hex(
                 trade_keys,
@@ -412,7 +448,9 @@ impl Order {
             fiat_amount: small_order.fiat_amount,
             payment_method: small_order.payment_method.clone(),
             premium: small_order.premium,
-            trade_keys: Some(trade_keys_hex),
+            // Security invariant: trade_keys ownership is bound to the persisted order row.
+            // DM hydration must never rotate/swap it from the decrypting trade context.
+            trade_keys: existing.and_then(|e| e.trade_keys.clone()),
             counterparty_pubkey,
             order_chat_shared_key_hex,
             dispute_id: existing.and_then(|e| e.dispute_id.clone()),
@@ -445,7 +483,16 @@ impl Order {
         trade_keys: &nostr_sdk::prelude::Keys,
         message_request_id: Option<i64>,
     ) -> Result<Self> {
-        let resolved_id = small_order.id.unwrap_or(order_id_fallback);
+        if let Some(payload_id) = small_order.id {
+            if payload_id != order_id_fallback {
+                anyhow::bail!(
+                    "Rejected DM order upsert: payload id {} does not match routed order id {}",
+                    payload_id,
+                    order_id_fallback
+                );
+            }
+        }
+        let resolved_id = order_id_fallback;
         small_order.id = Some(resolved_id);
         let id_str = resolved_id.to_string();
 
@@ -834,6 +881,14 @@ impl AdminDispute {
             };
 
             if is_unique_violation {
+                let existing = Self::get_by_id(pool, &dispute.id).await?;
+                if existing.is_finalized() {
+                    return Err(anyhow::anyhow!(
+                        "Refusing to overwrite finalized admin dispute for order {} (status: {})",
+                        dispute.id,
+                        existing.status.as_deref().unwrap_or("unknown")
+                    ));
+                }
                 dispute.update_db(pool).await?;
             } else {
                 return Err(e.into());
@@ -958,6 +1013,22 @@ impl AdminDispute {
         Ok(disputes)
     }
 
+    /// Get a dispute by order ID when present.
+    pub async fn try_get_by_id(pool: &SqlitePool, id: &str) -> Result<Option<AdminDispute>> {
+        let mut dispute = sqlx::query_as::<_, AdminDispute>(
+            r#"SELECT * FROM admin_disputes WHERE id = ? LIMIT 1"#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(ref mut dispute) = dispute {
+            dispute.deserialize_user_info();
+        }
+
+        Ok(dispute)
+    }
+
     /// Get a dispute by ID
     pub async fn get_by_id(pool: &SqlitePool, id: &str) -> Result<AdminDispute> {
         let mut dispute = sqlx::query_as::<_, AdminDispute>(
@@ -971,6 +1042,40 @@ impl AdminDispute {
         dispute.deserialize_user_info();
 
         Ok(dispute)
+    }
+
+    /// Get a taken dispute by its Mostro dispute UUID (`admin_disputes.dispute_id`).
+    pub async fn get_by_dispute_id(
+        pool: &SqlitePool,
+        dispute_id: &str,
+    ) -> Result<Option<AdminDispute>> {
+        let mut dispute = sqlx::query_as::<_, AdminDispute>(
+            r#"SELECT * FROM admin_disputes WHERE dispute_id = ? LIMIT 1"#,
+        )
+        .bind(dispute_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(ref mut dispute) = dispute {
+            dispute.deserialize_user_info();
+        }
+
+        Ok(dispute)
+    }
+
+    /// Dispute UUIDs still locally `in-progress` (targeted kind-38386 reconcile).
+    pub async fn list_in_progress_dispute_ids(pool: &SqlitePool) -> Result<Vec<String>> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            r#"SELECT dispute_id FROM admin_disputes
+               WHERE status = ?
+                 AND dispute_id IS NOT NULL
+                 AND dispute_id != ''
+               ORDER BY dispute_id"#,
+        )
+        .bind(DisputeStatus::InProgress.to_string())
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Helper method to deserialize JSON UserInfo fields
@@ -1047,14 +1152,34 @@ impl AdminDispute {
         Ok(())
     }
 
-    /// Check if the dispute is finalized (Settled, SellerRefunded, or Released)
+    /// Advance a taken dispute to `status` by Mostro dispute UUID.
     ///
-    /// A finalized dispute cannot have further actions taken on it.
-    pub fn is_finalized(&self) -> bool {
+    /// No-op (returns `false`) when the row is missing or already finalized, so a
+    /// later `seller-refunded` event cannot overwrite `settled`.
+    pub async fn set_status_by_dispute_id(
+        pool: &SqlitePool,
+        dispute_id: &str,
+        status: DisputeStatus,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE admin_disputes SET status = ?
+               WHERE dispute_id = ?
+                 AND (status IS NULL OR status NOT IN (?, ?, ?))"#,
+        )
+        .bind(status.to_string())
+        .bind(dispute_id)
+        .bind(DisputeStatus::Settled.to_string())
+        .bind(DisputeStatus::SellerRefunded.to_string())
+        .bind(DisputeStatus::Released.to_string())
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Whether a kebab-case dispute status is terminal (Settled, SellerRefunded, Released).
+    pub fn is_terminal_status(status: &str) -> bool {
         use std::str::FromStr;
-        self.status
-            .as_deref()
-            .and_then(|s| DisputeStatus::from_str(s).ok())
+        DisputeStatus::from_str(status)
             .map(|s| {
                 matches!(
                     s,
@@ -1064,6 +1189,13 @@ impl AdminDispute {
                 )
             })
             .unwrap_or(false)
+    }
+
+    /// Check if the dispute is finalized (Settled, SellerRefunded, or Released)
+    ///
+    /// A finalized dispute cannot have further actions taken on it.
+    pub fn is_finalized(&self) -> bool {
+        self.status.as_deref().is_some_and(Self::is_terminal_status)
     }
 
     /// Check if AdminSettle action can be performed on this dispute
@@ -1108,5 +1240,309 @@ mod terminal_dm_status_tests {
             expected, actual,
             "TERMINAL_DM_STATUSES must match mostro_core::order::Status::to_string()"
         );
+    }
+}
+
+#[cfg(test)]
+mod upsert_from_small_order_dm_tests {
+    use super::Order;
+    use mostro_core::prelude::{Kind, SmallOrder, Status};
+    use nostr_sdk::prelude::Keys;
+    use uuid::Uuid;
+
+    async fn create_test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::query(
+            r#"
+            CREATE TABLE orders (
+                id TEXT PRIMARY KEY, kind TEXT, status TEXT, amount INTEGER NOT NULL,
+                fiat_code TEXT NOT NULL, min_amount INTEGER, max_amount INTEGER,
+                fiat_amount INTEGER NOT NULL, payment_method TEXT NOT NULL,
+                premium INTEGER NOT NULL, trade_keys TEXT, counterparty_pubkey TEXT,
+                order_chat_shared_key_hex TEXT, dispute_id TEXT, solver_pubkey TEXT,
+                dispute_chat_shared_key_hex TEXT, is_mine INTEGER NOT NULL,
+                buyer_invoice TEXT, request_id INTEGER, trade_index INTEGER,
+                created_at INTEGER, expires_at INTEGER, last_seen_dm_ts INTEGER
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("orders table");
+        pool
+    }
+
+    fn sample_small_order(id: Uuid, amount: i64) -> SmallOrder {
+        SmallOrder {
+            id: Some(id),
+            kind: Some(Kind::Buy),
+            status: Some(Status::Active),
+            amount,
+            fiat_code: "USD".to_string(),
+            min_amount: None,
+            max_amount: None,
+            fiat_amount: 100,
+            payment_method: "bank".to_string(),
+            premium: 0,
+            buyer_trade_pubkey: None,
+            seller_trade_pubkey: None,
+            buyer_invoice: None,
+            created_at: None,
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_payload_id_mismatch_against_routed_order_id() {
+        let pool = create_test_pool().await;
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let keys_b = Keys::generate();
+        sqlx::query(
+            "INSERT INTO orders (id, kind, status, amount, fiat_code, fiat_amount, payment_method, premium, trade_keys, is_mine, trade_index) VALUES (?, 'buy', 'active', 1000, 'USD', 10, 'bank', 0, ?, 1, 7)",
+        )
+        .bind(id_b.to_string())
+        .bind(keys_b.secret_key().to_secret_hex())
+        .execute(&pool)
+        .await
+        .expect("seed order b");
+
+        let err = Order::upsert_from_small_order_dm(
+            &pool,
+            id_a,
+            sample_small_order(id_b, 1),
+            &Keys::generate(),
+            Some(1),
+        )
+        .await
+        .expect_err("mismatched id must fail");
+        assert!(err.to_string().contains("payload id"));
+
+        let untouched = Order::get_by_id(&pool, &id_b.to_string())
+            .await
+            .expect("order b still present");
+        assert_eq!(untouched.amount, 1000);
+        assert_eq!(
+            untouched.trade_keys.as_deref(),
+            Some(keys_b.secret_key().to_secret_hex().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_existing_trade_keys_on_dm_upsert() {
+        let pool = create_test_pool().await;
+        let id = Uuid::new_v4();
+        let stored_keys = Keys::generate();
+        let decrypting_keys = Keys::generate();
+        sqlx::query(
+            "INSERT INTO orders (id, kind, status, amount, fiat_code, fiat_amount, payment_method, premium, trade_keys, is_mine, trade_index) VALUES (?, 'buy', 'active', 1000, 'USD', 10, 'bank', 0, ?, 1, 3)",
+        )
+        .bind(id.to_string())
+        .bind(stored_keys.secret_key().to_secret_hex())
+        .execute(&pool)
+        .await
+        .expect("seed order");
+
+        Order::upsert_from_small_order_dm(
+            &pool,
+            id,
+            sample_small_order(id, 777),
+            &decrypting_keys,
+            Some(2),
+        )
+        .await
+        .expect("upsert succeeds");
+
+        let updated = Order::get_by_id(&pool, &id.to_string())
+            .await
+            .expect("updated order");
+        assert_eq!(updated.amount, 777);
+        assert_eq!(
+            updated.trade_keys.as_deref(),
+            Some(stored_keys.secret_key().to_secret_hex().as_str())
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_dispute_new_tests {
+    use super::AdminDispute;
+    use mostro_core::prelude::{DisputeStatus, SolverDisputeInfo};
+    use uuid::Uuid;
+
+    async fn create_admin_disputes_table(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            r#"
+            CREATE TABLE admin_disputes (
+                id TEXT PRIMARY KEY,
+                dispute_id TEXT NOT NULL,
+                kind TEXT,
+                status TEXT,
+                hash TEXT,
+                preimage TEXT,
+                order_previous_status TEXT,
+                initiator_pubkey TEXT NOT NULL,
+                buyer_pubkey TEXT,
+                seller_pubkey TEXT,
+                initiator_full_privacy INTEGER NOT NULL,
+                counterpart_full_privacy INTEGER NOT NULL,
+                initiator_info TEXT,
+                counterpart_info TEXT,
+                premium INTEGER NOT NULL,
+                payment_method TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                fiat_amount INTEGER NOT NULL,
+                fiat_code TEXT NOT NULL,
+                fee INTEGER NOT NULL,
+                routing_fee INTEGER NOT NULL,
+                buyer_invoice TEXT,
+                invoice_held_at INTEGER,
+                taken_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                buyer_chat_last_seen INTEGER,
+                seller_chat_last_seen INTEGER,
+                buyer_shared_key_hex TEXT,
+                seller_shared_key_hex TEXT
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("admin_disputes table");
+    }
+
+    fn solver_dispute_info(
+        order_id: Uuid,
+        status: &str,
+        payment_method: &str,
+    ) -> SolverDisputeInfo {
+        SolverDisputeInfo {
+            id: order_id,
+            kind: "sell".to_string(),
+            status: status.to_string(),
+            hash: Some("hash-abc".to_string()),
+            preimage: None,
+            order_previous_status: "active".to_string(),
+            initiator_pubkey: "02".repeat(32),
+            buyer_pubkey: Some("03".repeat(32)),
+            seller_pubkey: Some("04".repeat(32)),
+            initiator_full_privacy: false,
+            counterpart_full_privacy: false,
+            initiator_info: None,
+            counterpart_info: None,
+            premium: 1,
+            payment_method: payment_method.to_string(),
+            amount: 50_000,
+            fiat_amount: 75,
+            fee: 250,
+            routing_fee: 3,
+            buyer_invoice: None,
+            invoice_held_at: 1_700_000_000,
+            taken_at: 1_700_000_100,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_upsert_over_finalized_dispute() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        create_admin_disputes_table(&pool).await;
+
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO admin_disputes (
+                id, dispute_id, kind, status, initiator_pubkey, initiator_full_privacy,
+                counterpart_full_privacy, premium, payment_method, amount, fiat_amount,
+                fiat_code, fee, routing_fee, buyer_invoice, invoice_held_at, taken_at, created_at
+            ) VALUES (?, 'dispute-final-1', 'sell', 'settled', ?, 0, 0, 1,
+                'ORIGINAL zelle victim@example.com', 50000, 75, 'USD', 250, 3,
+                'lnbc-settled-buyer-invoice', 1700000000, 1700000100, 1700000000)"#,
+        )
+        .bind(order_id.to_string())
+        .bind("02".repeat(32))
+        .execute(&pool)
+        .await
+        .expect("insert settled row");
+
+        let err = AdminDispute::new(
+            &pool,
+            solver_dispute_info(
+                order_id,
+                &DisputeStatus::InProgress.to_string(),
+                "REPLACED pm attacker@evil.example",
+            ),
+            "dispute-reattack-2".to_string(),
+            Some("USD".to_string()),
+            None,
+        )
+        .await
+        .expect_err("must refuse to overwrite finalized row");
+        assert!(
+            err.to_string().contains("finalized"),
+            "unexpected error: {err}"
+        );
+
+        let unchanged = AdminDispute::get_by_id(&pool, &order_id.to_string())
+            .await
+            .expect("row still present");
+        assert!(unchanged.is_finalized());
+        assert_eq!(unchanged.dispute_id, "dispute-final-1");
+        assert_eq!(
+            unchanged.payment_method,
+            "ORIGINAL zelle victim@example.com"
+        );
+        assert_eq!(
+            unchanged.buyer_invoice.as_deref(),
+            Some("lnbc-settled-buyer-invoice")
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_upsert_over_in_progress_dispute() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        create_admin_disputes_table(&pool).await;
+
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO admin_disputes (
+                id, dispute_id, kind, status, initiator_pubkey, initiator_full_privacy,
+                counterpart_full_privacy, premium, payment_method, amount, fiat_amount,
+                fiat_code, fee, routing_fee, taken_at, created_at
+            ) VALUES (?, 'dispute-old', 'sell', 'in-progress', ?, 0, 0, 1,
+                'old pm', 50000, 75, 'USD', 250, 3, 1700000100, 1700000000)"#,
+        )
+        .bind(order_id.to_string())
+        .bind("02".repeat(32))
+        .execute(&pool)
+        .await
+        .expect("insert in-progress row");
+
+        AdminDispute::new(
+            &pool,
+            solver_dispute_info(
+                order_id,
+                &DisputeStatus::InProgress.to_string(),
+                "updated pm",
+            ),
+            "dispute-new".to_string(),
+            Some("EUR".to_string()),
+            None,
+        )
+        .await
+        .expect("in-progress upsert succeeds");
+
+        let updated = AdminDispute::get_by_id(&pool, &order_id.to_string())
+            .await
+            .expect("row updated");
+        assert_eq!(updated.status.as_deref(), Some("in-progress"));
+        assert_eq!(updated.dispute_id, "dispute-new");
+        assert_eq!(updated.payment_method, "updated pm");
+        assert_eq!(updated.fiat_code, "EUR");
     }
 }

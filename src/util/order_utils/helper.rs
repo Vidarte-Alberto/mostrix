@@ -148,6 +148,29 @@ pub(crate) fn is_terminal_trade_status(status: Status) -> bool {
     )
 }
 
+/// Outcome of an admin settle/cancel request after Mostro replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminFinalizeAck {
+    /// Mostro confirmed `AdminSettled` or `AdminCanceled`.
+    Confirmed,
+    /// Order was already cooperatively canceled; Mostro replied `CooperativeCancelAccepted`.
+    AlreadyCooperativelyCanceled,
+}
+
+/// Map a settle/cancel DM action to [`AdminFinalizeAck`].
+pub(super) fn admin_finalize_ack(action: Action, expected: Action) -> Result<AdminFinalizeAck> {
+    if action == expected {
+        Ok(AdminFinalizeAck::Confirmed)
+    } else if action == Action::CooperativeCancelAccepted {
+        Ok(AdminFinalizeAck::AlreadyCooperativelyCanceled)
+    } else {
+        Err(anyhow::anyhow!(
+            "Unexpected action in response: {:?}",
+            action
+        ))
+    }
+}
+
 /// Guard status writes against backward transitions from stale/out-of-order DMs.
 ///
 /// Returns `true` when `candidate` is equal/newer than `current` in the actor-aware phase graph.
@@ -397,6 +420,9 @@ pub fn parse_orders_events(
 
 /// Fetch raw Mostro order-kind events from relays (same filter as [`fetch_events_list`] for orders).
 ///
+/// Events are filtered client-side to include only those authored by `mostro_pubkey`, since relay-side
+/// author filtering cannot be trusted.
+///
 /// Relay queries are capped (see [`crate::util::filters::MOSTRO_LIST_FETCH_EVENT_LIMIT`]); very old
 /// order updates may not be included in the snapshot.
 pub async fn fetch_mostro_order_events(
@@ -404,10 +430,14 @@ pub async fn fetch_mostro_order_events(
     mostro_pubkey: PublicKey,
 ) -> Result<NostrEvents> {
     let filters = create_filter(ListKind::Orders, mostro_pubkey, None)?;
-    Ok(client
+    let events = client
         .fetch_events(filters)
         .timeout(FETCH_EVENTS_TIMEOUT)
-        .await?)
+        .await?;
+    Ok(events
+        .into_iter()
+        .filter(|e| e.pubkey == mostro_pubkey)
+        .collect())
 }
 
 /// Pending listings for the public order book from an aggregated relay snapshot.
@@ -451,10 +481,13 @@ pub async fn fetch_events_list(
         }
         ListKind::Disputes => {
             let filters = create_filter(list_kind, mostro_pubkey, None)?;
-            let fetched_events = client
+            let fetched_events: NostrEvents = client
                 .fetch_events(filters)
                 .timeout(FETCH_EVENTS_TIMEOUT)
-                .await?;
+                .await?
+                .into_iter()
+                .filter(|e| e.pubkey == mostro_pubkey)
+                .collect();
             let disputes = parse_disputes_events(fetched_events);
             Ok(disputes.into_iter().map(Event::Dispute).collect())
         }
@@ -509,6 +542,7 @@ pub async fn get_disputes(client: &Client, mostro_pubkey: PublicKey) -> Result<V
 
 /// Fetch the latest [`SmallOrder`] for one order id from relays (author + custom order kind + `d` tag).
 ///
+/// Only events authored by `mostro_pubkey` are considered (client-side verification).
 /// Uses `limit(10)` and picks the event with the greatest [`Event::created_at`] so relays that return
 /// multiple revisions for the same identifier still resolve to the newest snapshot.
 pub async fn fetch_small_order_by_id_from_relay(
@@ -526,10 +560,47 @@ pub async fn fetch_small_order_by_id_from_relay(
         .timeout(FETCH_EVENTS_TIMEOUT)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch order from relay by id: {}", e))?;
-    let Some(best) = events.iter().max_by_key(|e| e.created_at) else {
+    let Some(best) = events
+        .iter()
+        .filter(|e| e.pubkey == mostro_pubkey)
+        .max_by_key(|e| e.created_at)
+    else {
         return Ok(None);
     };
     Ok(Some(order_from_tags(best.tags.clone())?))
+}
+
+/// Fetch the latest kind-38386 [`Dispute`] for one dispute id (`d` tag).
+///
+/// Only events authored by `mostro_pubkey` are considered (client-side verification).
+/// Uses `limit(10)` and picks the event with the greatest [`Event::created_at`].
+pub async fn fetch_dispute_by_id_from_relay(
+    client: &Client,
+    mostro_pubkey: PublicKey,
+    dispute_id: Uuid,
+) -> Result<Option<Dispute>> {
+    let filter = Filter::new()
+        .author(mostro_pubkey)
+        .kind(nostr_sdk::prelude::Kind::Custom(NOSTR_DISPUTE_EVENT_KIND))
+        .identifier(dispute_id.to_string())
+        .limit(10);
+    let events = client
+        .fetch_events(filter)
+        .timeout(FETCH_EVENTS_TIMEOUT)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch dispute from relay by id: {}", e))?;
+    let Some(best) = events
+        .iter()
+        .filter(|e| e.pubkey == mostro_pubkey)
+        .max_by_key(|e| e.created_at)
+    else {
+        return Ok(None);
+    };
+    let mut dispute = dispute_from_tags(best.tags.clone())?;
+    if dispute.created_at <= 0 {
+        dispute.created_at = best.created_at.as_secs() as i64;
+    }
+    Ok(Some(dispute))
 }
 
 /// Fetch a single order's fiat code from the relay by order id (identifier "d" tag).
@@ -703,41 +774,36 @@ pub(super) fn handle_mostro_response(
         return Err(anyhow::anyhow!(error_msg));
     }
 
-    // Validate request_id if present
-    if let Some(id) = inner_message.request_id {
-        if id != expected_request_id {
+    // Waiter path: every response must carry the in-flight request_id (see take_order.rs).
+    match inner_message.request_id {
+        Some(id) if id != expected_request_id => {
             log::warn!(
                 "Received response with mismatched request_id. Expected: {}, Got: {}",
                 expected_request_id,
                 id
             );
-            return Err(anyhow::anyhow!("Mismatched request_id"));
+            Err(anyhow::anyhow!("Mismatched request_id"))
         }
-    } else if inner_message.action != Action::RateReceived
-        && inner_message.action != Action::NewOrder
-        && inner_message.action != Action::AddInvoice
-        && inner_message.action != Action::AddBondInvoice
-        && inner_message.action != Action::PayInvoice
-        && inner_message.action != Action::PayBondInvoice
-    {
-        log::warn!(
-            "Received response with null request_id. Expected: {}",
-            expected_request_id
-        );
-        return Err(anyhow::anyhow!("Response with null request_id"));
+        Some(_) => Ok(inner_message),
+        None => {
+            log::warn!(
+                "Received response with null request_id. Expected: {}",
+                expected_request_id
+            );
+            Err(anyhow::anyhow!("Response with null request_id"))
+        }
     }
-
-    Ok(inner_message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dispute_from_tags, inferred_status_from_trade_action, is_terminal_trade_status,
-        parse_disputes_events, should_apply_status_transition, should_strictly_advance_status,
+        admin_finalize_ack, dispute_from_tags, handle_mostro_response,
+        inferred_status_from_trade_action, is_terminal_trade_status, parse_disputes_events,
+        should_apply_status_transition, should_strictly_advance_status, AdminFinalizeAck,
     };
     use crate::models::TERMINAL_ORDER_HISTORY_STATUSES;
-    use mostro_core::prelude::{Action, DisputeStatus, Status, NOSTR_DISPUTE_EVENT_KIND};
+    use mostro_core::prelude::{Action, DisputeStatus, Message, Status, NOSTR_DISPUTE_EVENT_KIND};
     use nostr_sdk::prelude::*;
     use std::collections::BTreeSet;
     use std::str::FromStr;
@@ -946,5 +1012,79 @@ mod tests {
             Status::WaitingPayment,
             kind,
         ));
+    }
+
+    #[test]
+    fn admin_finalize_ack_accepts_expected_and_cooperative_cancel() {
+        assert_eq!(
+            admin_finalize_ack(Action::AdminCanceled, Action::AdminCanceled).unwrap(),
+            AdminFinalizeAck::Confirmed
+        );
+        assert_eq!(
+            admin_finalize_ack(Action::AdminSettled, Action::AdminSettled).unwrap(),
+            AdminFinalizeAck::Confirmed
+        );
+        assert_eq!(
+            admin_finalize_ack(Action::CooperativeCancelAccepted, Action::AdminCanceled).unwrap(),
+            AdminFinalizeAck::AlreadyCooperativelyCanceled
+        );
+        assert_eq!(
+            admin_finalize_ack(Action::CooperativeCancelAccepted, Action::AdminSettled).unwrap(),
+            AdminFinalizeAck::AlreadyCooperativelyCanceled
+        );
+        assert!(admin_finalize_ack(Action::Canceled, Action::AdminCanceled).is_err());
+    }
+
+    #[test]
+    fn handle_mostro_response_rejects_null_request_id_on_waiter_path() {
+        const EXPECTED_RID: u64 = 0xC0FF_EE00_1234_5678;
+
+        for action in [
+            Action::RateReceived,
+            Action::NewOrder,
+            Action::AddInvoice,
+            Action::AddBondInvoice,
+            Action::PayInvoice,
+            Action::PayBondInvoice,
+        ] {
+            let message =
+                Message::new_order(Some(Uuid::new_v4()), None, None, action.clone(), None);
+            let err = handle_mostro_response(&message, EXPECTED_RID)
+                .expect_err("null request_id must fail closed on waiter path");
+            assert!(
+                err.to_string().contains("null request_id"),
+                "action {action:?} should reject null request_id"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_mostro_response_accepts_matching_request_id() {
+        const EXPECTED_RID: u64 = 0xC0FF_EE00_1234_5678;
+        let message = Message::new_order(
+            Some(Uuid::new_v4()),
+            Some(EXPECTED_RID),
+            None,
+            Action::PayInvoice,
+            None,
+        );
+        let inner = handle_mostro_response(&message, EXPECTED_RID).expect("matching rid");
+        assert_eq!(inner.request_id, Some(EXPECTED_RID));
+        assert_eq!(inner.action, Action::PayInvoice);
+    }
+
+    #[test]
+    fn handle_mostro_response_rejects_mismatched_request_id() {
+        const EXPECTED_RID: u64 = 0xC0FF_EE00_1234_5678;
+        let message = Message::new_order(
+            Some(Uuid::new_v4()),
+            Some(EXPECTED_RID.wrapping_add(1)),
+            None,
+            Action::PayInvoice,
+            None,
+        );
+        let err = handle_mostro_response(&message, EXPECTED_RID)
+            .expect_err("mismatched request_id must be rejected");
+        assert!(err.to_string().contains("Mismatched request_id"));
     }
 }
