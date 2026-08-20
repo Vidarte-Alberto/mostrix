@@ -62,7 +62,7 @@ pub struct StartupBootstrap {
     pub client: Client,
     pub mostro_pubkey: PublicKey,
     pub current_mostro_pubkey: Arc<Mutex<PublicKey>>,
-    pub orders: Arc<Mutex<Vec<SmallOrder>>>,
+    pub orders: Arc<Mutex<Vec<crate::util::BookOrder>>>,
     pub disputes: Arc<Mutex<Vec<Dispute>>>,
     pub order_task: JoinHandle<()>,
     pub dispute_task: JoinHandle<()>,

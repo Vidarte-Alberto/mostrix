@@ -41,7 +41,7 @@ use zeroize::Zeroizing;
 
 /// Context passed to Enter and confirmation handlers to avoid too many arguments.
 pub struct EnterKeyContext<'a> {
-    pub orders: &'a Arc<Mutex<Vec<SmallOrder>>>,
+    pub orders: &'a Arc<Mutex<Vec<crate::util::BookOrder>>>,
     pub disputes: &'a Arc<Mutex<Vec<Dispute>>>,
     pub pool: &'a SqlitePool,
     pub client: &'a Client,
@@ -565,7 +565,7 @@ fn update_invoice_notification_action_selection(
 pub fn handle_key_event(
     key_event: KeyEvent,
     app: &mut AppState,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<Dispute>>>,
     pool: &SqlitePool,
     client: &Client,

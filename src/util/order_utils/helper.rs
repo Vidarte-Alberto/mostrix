@@ -6,11 +6,13 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use serde::Deserialize;
+
 use crate::ui::state::{OperationResult, OrderChatStaticHeader, OrderSuccess, TakeOrderState};
 use crate::util::db_utils::save_order;
 use crate::util::dm_utils::FETCH_EVENTS_TIMEOUT;
 use crate::util::filters::create_filter;
-use crate::util::types::{get_cant_do_description, Event, ListKind};
+use crate::util::types::{get_cant_do_description, BookOrder, Event, ListKind};
 use crate::util::OrderDmSubscriptionCmd;
 use sqlx::SqlitePool;
 use std::collections::BTreeSet;
@@ -72,6 +74,50 @@ pub fn order_from_tags(tags: Tags) -> Result<SmallOrder> {
     }
 
     Ok(order)
+}
+
+#[derive(Deserialize)]
+struct PublishedRating {
+    #[serde(default)]
+    total_reviews: i64,
+    #[serde(default)]
+    total_rating: f64,
+    #[serde(default)]
+    days: u64,
+}
+
+fn reputation_from_tags(tags: &Tags) -> Option<UserInfo> {
+    let raw = tags.iter().find_map(|tag| {
+        let values = tag.as_slice();
+        (values.first().map(String::as_str) == Some("rating"))
+            .then(|| values.get(1).cloned())
+            .flatten()
+    })?;
+    if raw == "none" {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let rating_value = match value {
+        serde_json::Value::Array(values)
+            if values.first().and_then(serde_json::Value::as_str) == Some("rating") =>
+        {
+            values.get(1)?.clone()
+        }
+        value => value,
+    };
+    let rating: PublishedRating = serde_json::from_value(rating_value).ok()?;
+    Some(UserInfo {
+        rating: rating.total_rating,
+        reviews: rating.total_reviews,
+        operating_days: rating.days,
+    })
+}
+
+fn book_order_from_event(event: &nostr_sdk::prelude::Event) -> Result<BookOrder> {
+    let mut order = order_from_tags(event.tags.clone())?;
+    order.created_at = Some(event.created_at.as_secs() as i64);
+    Ok(BookOrder::new(order, reputation_from_tags(&event.tags)))
 }
 
 /// Infer `Status` from the message `action` when there is no `SmallOrder` payload
@@ -346,42 +392,41 @@ pub fn parse_disputes_events(events: NostrEvents) -> Vec<Dispute> {
     disputes_list
 }
 
-/// Latest [`SmallOrder`] per order id from Mostro nostr order events (newest event wins).
+/// Latest [`BookOrder`] per order id from Mostro nostr order events (newest event wins).
 ///
 /// Does not apply currency, status, or kind filters — use [`parse_orders_events`] for that.
-pub fn aggregate_latest_orders_by_id(events: &NostrEvents) -> HashMap<Uuid, SmallOrder> {
-    let mut latest_by_id: HashMap<Uuid, SmallOrder> = HashMap::new();
+pub fn aggregate_latest_orders_by_id(events: &NostrEvents) -> HashMap<Uuid, BookOrder> {
+    let mut latest_by_id: HashMap<Uuid, BookOrder> = HashMap::new();
 
     for event in events.iter() {
-        let mut order = match order_from_tags(event.tags.clone()) {
+        let book_order = match book_order_from_event(event) {
             Ok(o) => o,
             Err(e) => {
                 log::error!("{e:?}");
                 continue;
             }
         };
-        let order_id = match order.id {
+        let order_id = match book_order.order.id {
             Some(id) => id,
             None => {
                 log::info!("Order ID is none");
                 continue;
             }
         };
-        if order.kind.is_none() {
+        if book_order.order.kind.is_none() {
             log::info!("Order kind is none");
             continue;
         }
-        order.created_at = Some(event.created_at.as_secs() as i64);
         latest_by_id
             .entry(order_id)
             .and_modify(|existing| {
-                let new_ts = order.created_at.unwrap_or(0);
-                let old_ts = existing.created_at.unwrap_or(0);
+                let new_ts = book_order.order.created_at.unwrap_or(0);
+                let old_ts = existing.order.created_at.unwrap_or(0);
                 if new_ts > old_ts {
-                    *existing = order.clone();
+                    *existing = book_order.clone();
                 }
             })
-            .or_insert(order);
+            .or_insert(book_order);
     }
 
     latest_by_id
@@ -398,20 +443,21 @@ pub fn parse_orders_events(
 
     let mut requested: Vec<SmallOrder> = latest_by_id
         .into_values()
-        .filter(|o| status.map(|s| o.status == Some(s)).unwrap_or(true))
+        .filter(|o| status.map(|s| o.order.status == Some(s)).unwrap_or(true))
         .filter(|o| {
             // If currencies filter is provided and not empty, filter by any currency in the list
             // If currencies is None or empty, show all orders (no filter)
             currencies
                 .as_ref()
-                .map(|currencies| currencies.is_empty() || currencies.contains(&o.fiat_code))
+                .map(|currencies| currencies.is_empty() || currencies.contains(&o.order.fiat_code))
                 .unwrap_or(true)
         })
         .filter(|o| {
             kind.as_ref()
-                .map(|k| o.kind.as_ref() == Some(k))
+                .map(|k| o.order.kind.as_ref() == Some(k))
                 .unwrap_or(true)
         })
+        .map(|o| o.order)
         .collect();
 
     requested.sort_by_key(|b| std::cmp::Reverse(b.created_at));
@@ -445,21 +491,23 @@ pub async fn fetch_mostro_order_events(
 /// Applies the same currency rules as [`parse_orders_events`] when `status` is pending-only:
 /// empty `currencies` list means no filter; `None` means no filter.
 pub fn pending_orders_for_book(
-    latest: &HashMap<Uuid, SmallOrder>,
+    latest: &HashMap<Uuid, BookOrder>,
     currencies: Option<Vec<String>>,
-) -> Vec<SmallOrder> {
-    let mut requested: Vec<SmallOrder> = latest
+) -> Vec<BookOrder> {
+    let mut requested: Vec<BookOrder> = latest
         .values()
         .filter(|o| {
-            o.status == Some(Status::Pending)
+            o.order.status == Some(Status::Pending)
                 && currencies
                     .as_ref()
-                    .map(|currencies| currencies.is_empty() || currencies.contains(&o.fiat_code))
+                    .map(|currencies| {
+                        currencies.is_empty() || currencies.contains(&o.order.fiat_code)
+                    })
                     .unwrap_or(true)
         })
         .cloned()
         .collect();
-    requested.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+    requested.sort_by_key(|b| std::cmp::Reverse(b.order.created_at));
     requested
 }
 
@@ -798,12 +846,15 @@ pub(super) fn handle_mostro_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_finalize_ack, dispute_from_tags, handle_mostro_response,
-        inferred_status_from_trade_action, is_terminal_trade_status, parse_disputes_events,
-        should_apply_status_transition, should_strictly_advance_status, AdminFinalizeAck,
+        admin_finalize_ack, aggregate_latest_orders_by_id, dispute_from_tags,
+        handle_mostro_response, inferred_status_from_trade_action, is_terminal_trade_status,
+        parse_disputes_events, reputation_from_tags, should_apply_status_transition,
+        should_strictly_advance_status, AdminFinalizeAck,
     };
     use crate::models::TERMINAL_ORDER_HISTORY_STATUSES;
-    use mostro_core::prelude::{Action, DisputeStatus, Message, Status, NOSTR_DISPUTE_EVENT_KIND};
+    use mostro_core::prelude::{
+        Action, DisputeStatus, Message, Status, NOSTR_DISPUTE_EVENT_KIND, NOSTR_ORDER_EVENT_KIND,
+    };
     use nostr_sdk::prelude::*;
     use std::collections::BTreeSet;
     use std::str::FromStr;
@@ -832,6 +883,81 @@ mod tests {
             .custom_created_at(Timestamp::from(published_at))
             .finalize(keys)
             .expect("dispute event")
+    }
+
+    fn rating_tags(value: &str) -> Tags {
+        Tags::from_list(vec![Tag::custom("rating", vec![value.to_string()])])
+    }
+
+    fn order_event(keys: &Keys, id: Uuid, rating: &str, published_at: u64) -> Event {
+        EventBuilder::new(Kind::Custom(NOSTR_ORDER_EVENT_KIND), "")
+            .tags(Tags::from_list(vec![
+                Tag::identifier(id.to_string()),
+                Tag::custom("k", vec!["buy".to_string()]),
+                Tag::custom("s", vec!["pending".to_string()]),
+                Tag::custom("f", vec!["USD".to_string()]),
+                Tag::custom("rating", vec![rating.to_string()]),
+            ]))
+            .custom_created_at(Timestamp::from(published_at))
+            .finalize(keys)
+            .expect("order event")
+    }
+
+    #[test]
+    fn reputation_parses_current_object_shape() {
+        let info = reputation_from_tags(&rating_tags(
+            r#"{"total_reviews":5,"total_rating":4.5,"days":30}"#,
+        ))
+        .unwrap();
+        assert_eq!(info.rating, 4.5);
+        assert_eq!(info.reviews, 5);
+        assert_eq!(info.operating_days, 30);
+    }
+
+    #[test]
+    fn reputation_parses_legacy_nested_shape() {
+        let info = reputation_from_tags(&rating_tags(
+            r#"["rating",{"total_reviews":7,"total_rating":4.8,"days":90}]"#,
+        ))
+        .unwrap();
+        assert_eq!(info.rating, 4.8);
+        assert_eq!(info.reviews, 7);
+        assert_eq!(info.operating_days, 90);
+    }
+
+    #[test]
+    fn reputation_missing_none_or_malformed_is_unavailable() {
+        assert!(reputation_from_tags(&Tags::new()).is_none());
+        assert!(reputation_from_tags(&rating_tags("none")).is_none());
+        assert!(reputation_from_tags(&rating_tags("not-json")).is_none());
+    }
+
+    #[test]
+    fn latest_order_revision_replaces_order_and_rating_together() {
+        let keys = Keys::generate();
+        let id = Uuid::new_v4();
+        let events = [
+            order_event(
+                &keys,
+                id,
+                r#"{"total_reviews":1,"total_rating":3.0,"days":2}"#,
+                100,
+            ),
+            order_event(
+                &keys,
+                id,
+                r#"{"total_reviews":2,"total_rating":4.0,"days":3}"#,
+                200,
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let latest = aggregate_latest_orders_by_id(&events);
+        let row = latest.get(&id).unwrap();
+        assert_eq!(row.order.created_at, Some(200));
+        assert_eq!(row.reputation.as_ref().unwrap().rating, 4.0);
+        assert_eq!(row.reputation.as_ref().unwrap().reviews, 2);
     }
 
     #[test]

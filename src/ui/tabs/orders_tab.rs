@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use mostro_core::prelude::*;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -11,6 +10,8 @@ use crate::ui::helpers::{
     selected_book_display_idx,
 };
 use crate::ui::{apply_kind_color, AppState, BACKGROUND_COLOR, PRIMARY_COLOR};
+
+const FULL_ORDERS_TABLE_MIN_WIDTH: u16 = 125;
 
 /// Renders the available orders table, with fewer columns when terminal width is limited.
 ///
@@ -23,7 +24,7 @@ use crate::ui::{apply_kind_color, AppState, BACKGROUND_COLOR, PRIMARY_COLOR};
 pub fn render_orders_tab(
     f: &mut ratatui::Frame,
     area: Rect,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     app: &mut AppState,
 ) {
     let orders_lock = match orders.lock() {
@@ -87,7 +88,7 @@ pub fn render_orders_tab(
     let display_selected_idx =
         selected_book_display_idx(app.selected_order_id, &filtered).unwrap_or(0);
 
-    let compact = area.width < 100;
+    let compact = area.width < FULL_ORDERS_TABLE_MIN_WIDTH;
     // Drop the header when height < 4 so at least one data row stays visible
     // (same short-terminal rule as Disputes Pending).
     let show_header = area.height >= 4;
@@ -102,6 +103,7 @@ pub fn render_orders_tab(
             "💱 Fiat",
             "💵 Fiat Amt",
             "± Premium",
+            "⭐ Rate",
             "💳 Payment Method",
             "📅 Created",
         ]
@@ -109,7 +111,8 @@ pub fn render_orders_tab(
 
     let rows: Vec<Row> = filtered
         .iter()
-        .map(|(_orig, order)| {
+        .map(|(_orig, book_order)| {
+            let order = &book_order.order;
             let kind_cell = if let Some(k) = &order.kind {
                 Cell::from(k.to_string()).style(apply_kind_color(k))
             } else {
@@ -151,6 +154,14 @@ pub fn render_orders_tab(
 
             let payment_method_cell = Cell::from(order.payment_method.clone());
             let premium_cell = premium_cell(order.premium);
+            let rating_cell = Cell::from(
+                book_order
+                    .reputation
+                    .as_ref()
+                    .map(|info| format!("{:.1}/5", info.rating.clamp(0.0, 5.0)))
+                    .unwrap_or_else(|| "—".to_string()),
+            )
+            .style(Style::default().fg(Color::Yellow));
 
             // Missing created_at must not fall back to epoch (unwrap_or(0)); propagate None.
             let date_cell = Cell::from(
@@ -176,6 +187,7 @@ pub fn render_orders_tab(
                     fiat_code_cell,
                     fiat_amount_cell,
                     premium_cell,
+                    rating_cell,
                     payment_method_cell,
                     date_cell,
                 ])
@@ -193,14 +205,15 @@ pub fn render_orders_tab(
     } else {
         vec![
             Constraint::Max(8),
-            Constraint::Max(15),
-            Constraint::Max(10),
             Constraint::Max(12),
             Constraint::Max(10),
+            Constraint::Max(10),
+            Constraint::Max(8),
             Constraint::Max(12),
+            Constraint::Max(10),
             Constraint::Max(10),
             Constraint::Min(15),
-            Constraint::Max(18),
+            Constraint::Max(16),
         ]
     };
 
@@ -247,6 +260,7 @@ fn premium_cell(premium: i64) -> Cell<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mostro_core::prelude::SmallOrder;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use uuid::Uuid;
@@ -264,17 +278,20 @@ mod tests {
         flat.contains(needle)
     }
 
-    fn sample_order(payment_method: &str, premium: i64) -> SmallOrder {
-        SmallOrder {
-            id: Some(Uuid::new_v4()),
-            kind: Some(mostro_core::order::Kind::Buy),
-            fiat_code: "USD".to_string(),
-            fiat_amount: 100,
-            amount: 50_000,
-            premium,
-            payment_method: payment_method.to_string(),
-            ..Default::default()
-        }
+    fn sample_order(payment_method: &str, premium: i64) -> crate::util::BookOrder {
+        crate::util::BookOrder::new(
+            SmallOrder {
+                id: Some(Uuid::new_v4()),
+                kind: Some(mostro_core::order::Kind::Buy),
+                fiat_code: "USD".to_string(),
+                fiat_amount: 100,
+                amount: 50_000,
+                premium,
+                payment_method: payment_method.to_string(),
+                ..Default::default()
+            },
+            None,
+        )
     }
 
     fn render_at_width(width: u16, premium: i64) -> ratatui::buffer::Buffer {
@@ -297,6 +314,34 @@ mod tests {
     }
 
     #[test]
+    fn wide_orders_table_renders_maker_rating() {
+        let mut book_order = sample_order("SEPA", 0);
+        book_order.reputation = Some(mostro_core::prelude::UserInfo {
+            rating: 4.5,
+            reviews: 12,
+            operating_days: 90,
+        });
+        let orders = Arc::new(Mutex::new(vec![book_order]));
+        let mut app = AppState::new(UserRole::User);
+        let backend = TestBackend::new(130, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_orders_tab(f, f.area(), &orders, &mut app))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        assert!(buffer_contains(buf, "Rate"));
+        assert!(buffer_contains(buf, "4.5/5"));
+    }
+
+    #[test]
+    fn wide_orders_table_marks_missing_rating() {
+        let buf = render_at_width(130, 0);
+        assert!(buffer_contains(&buf, "Rate"));
+        assert!(buffer_contains(&buf, "—"));
+    }
+
+    #[test]
     fn narrow_orders_table_keeps_premium_readable() {
         let buf = render_at_width(60, -3);
         assert!(buffer_contains(&buf, "Premium"));
@@ -304,6 +349,7 @@ mod tests {
         assert!(buffer_contains(&buf, "100 USD"));
         assert!(buffer_contains(&buf, "SEPA"));
         assert!(!buffer_contains(&buf, "Created"));
+        assert!(!buffer_contains(&buf, "Rate"));
     }
 
     /// When more orders exist than table body rows, selecting a late row must
@@ -314,7 +360,7 @@ mod tests {
         let mut last_id = Uuid::nil();
         for i in 0..40 {
             let o = sample_order(&format!("PAY-{i:02}"), 0);
-            last_id = o.id.unwrap();
+            last_id = o.order.id.unwrap();
             book.push(o);
         }
         let orders = Arc::new(Mutex::new(book));
@@ -345,7 +391,7 @@ mod tests {
         for i in 0..40 {
             let o = sample_order(&format!("PAY-{i:02}"), 0);
             if i == 0 {
-                first_id = o.id.unwrap();
+                first_id = o.order.id.unwrap();
             }
             book.push(o);
         }
@@ -376,24 +422,30 @@ mod tests {
         let usd_id = Uuid::new_v4();
         let eur_id = Uuid::new_v4();
         let orders = Arc::new(Mutex::new(vec![
-            SmallOrder {
-                id: Some(usd_id),
-                kind: Some(mostro_core::order::Kind::Buy),
-                fiat_code: "USD".to_string(),
-                fiat_amount: 100,
-                amount: 50_000,
-                payment_method: "PAY-USD".to_string(),
-                ..Default::default()
-            },
-            SmallOrder {
-                id: Some(eur_id),
-                kind: Some(mostro_core::order::Kind::Sell),
-                fiat_code: "EUR".to_string(),
-                fiat_amount: 200,
-                amount: 60_000,
-                payment_method: "PAY-EUR".to_string(),
-                ..Default::default()
-            },
+            crate::util::BookOrder::new(
+                SmallOrder {
+                    id: Some(usd_id),
+                    kind: Some(mostro_core::order::Kind::Buy),
+                    fiat_code: "USD".to_string(),
+                    fiat_amount: 100,
+                    amount: 50_000,
+                    payment_method: "PAY-USD".to_string(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            crate::util::BookOrder::new(
+                SmallOrder {
+                    id: Some(eur_id),
+                    kind: Some(mostro_core::order::Kind::Sell),
+                    fiat_code: "EUR".to_string(),
+                    fiat_amount: 200,
+                    amount: 60_000,
+                    payment_method: "PAY-EUR".to_string(),
+                    ..Default::default()
+                },
+                None,
+            ),
         ]));
         let mut app = AppState::new(UserRole::User);
         app.selected_order_id = Some(usd_id);
@@ -428,7 +480,7 @@ mod tests {
         let mut last_id = Uuid::nil();
         for i in 0..40 {
             let o = sample_order(&format!("PAY-{i:02}"), 0);
-            last_id = o.id.unwrap();
+            last_id = o.order.id.unwrap();
             book.push(o);
         }
         let orders = Arc::new(Mutex::new(book));
@@ -468,7 +520,7 @@ mod tests {
         let mut last_id = Uuid::nil();
         for i in 0..40 {
             let o = sample_order(&format!("PAY-{i:02}"), 0);
-            last_id = o.id.unwrap();
+            last_id = o.order.id.unwrap();
             book.push(o);
         }
         let orders = Arc::new(Mutex::new(book));
@@ -501,7 +553,7 @@ mod tests {
     #[test]
     fn short_area_drops_header_but_shows_selected_row() {
         let o = sample_order("PAY-SHORT", 0);
-        let id = o.id.unwrap();
+        let id = o.order.id.unwrap();
         let orders = Arc::new(Mutex::new(vec![o]));
         let mut app = AppState::new(UserRole::User);
         app.selected_order_id = Some(id);

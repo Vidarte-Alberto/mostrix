@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 pub fn handle_navigation(
     code: KeyCode,
     app: &mut AppState,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<mostro_core::prelude::Dispute>>>,
 ) {
     match code {
@@ -27,7 +27,7 @@ pub fn handle_navigation(
     }
 }
 
-fn handle_left_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<SmallOrder>>>) {
+fn handle_left_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>) {
     // Leaving Create New Order silently keeps the draft for when the user returns.
     if let UiMode::UserMode(UserMode::CreatingOrder(form)) = &app.mode {
         if matches!(app.active_tab, Tab::User(UserTab::CreateNewOrder)) {
@@ -98,7 +98,7 @@ fn handle_left_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<SmallOrder>>>) {
     }
 }
 
-fn handle_right_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<SmallOrder>>>) {
+fn handle_right_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>) {
     // Leaving Create New Order silently keeps the draft for when the user returns.
     if let UiMode::UserMode(UserMode::CreatingOrder(form)) = &app.mode {
         if matches!(app.active_tab, Tab::User(UserTab::CreateNewOrder)) {
@@ -171,7 +171,7 @@ fn handle_right_key(app: &mut AppState, _orders: &Arc<Mutex<Vec<SmallOrder>>>) {
 
 fn handle_up_key(
     app: &mut AppState,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<Dispute>>>,
 ) {
     match &mut app.mode {
@@ -294,7 +294,7 @@ fn handle_up_key(
 
 fn handle_down_key(
     app: &mut AppState,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<Dispute>>>,
 ) {
     match &mut app.mode {

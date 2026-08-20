@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Duration, Instant};
 
 use crate::settings::Settings;
-use crate::util::catch_unwind_request_fatal_restart;
+use crate::util::{catch_unwind_request_fatal_restart, BookOrder};
 use sqlx::SqlitePool;
 
 use super::get_disputes;
@@ -28,7 +28,7 @@ use super::relay_order_db_reconcile::{
 /// Result of starting the fetch scheduler
 /// Contains shared state for orders and disputes that are periodically updated
 pub struct FetchSchedulerResult {
-    pub orders: Arc<Mutex<Vec<SmallOrder>>>,
+    pub orders: Arc<Mutex<Vec<BookOrder>>>,
     pub disputes: Arc<Mutex<Vec<Dispute>>>,
     /// Background task for periodic order fetches; abort and call [`spawn_fetch_scheduler_loops`]
     /// after a soft client reload so polls use the new session.
@@ -40,8 +40,8 @@ pub struct FetchSchedulerResult {
 // Semaphore to prevent multiple chat messages from being processed at the same time
 const RECONCILIATION_INTERVAL_SECS: u64 = 30;
 
-fn apply_live_order_update(orders: &Arc<Mutex<Vec<SmallOrder>>>, order: SmallOrder) {
-    let Some(order_id) = order.id else {
+fn apply_live_order_update(orders: &Arc<Mutex<Vec<BookOrder>>>, order: BookOrder) {
+    let Some(order_id) = order.order.id else {
         return;
     };
     let mut orders_lock = match orders.lock() {
@@ -53,29 +53,29 @@ fn apply_live_order_update(orders: &Arc<Mutex<Vec<SmallOrder>>>, order: SmallOrd
             return;
         }
     };
-    if order.status != Some(Status::Pending) {
+    if order.order.status != Some(Status::Pending) {
         log::debug!(
             "[orders_live] removing non-pending order_id={} status={:?}",
             order_id,
-            order.status
+            order.order.status
         );
-        orders_lock.retain(|existing| existing.id != Some(order_id));
+        orders_lock.retain(|existing| existing.order.id != Some(order_id));
         return;
     }
 
     if let Some(existing) = orders_lock
         .iter_mut()
-        .find(|existing| existing.id == Some(order_id))
+        .find(|existing| existing.order.id == Some(order_id))
     {
-        let existing_ts = existing.created_at.unwrap_or(0);
-        let new_ts = order.created_at.unwrap_or(0);
+        let existing_ts = existing.order.created_at.unwrap_or(0);
+        let new_ts = order.order.created_at.unwrap_or(0);
         if new_ts >= existing_ts {
             *existing = order;
         }
     } else {
         orders_lock.push(order);
     }
-    orders_lock.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+    orders_lock.sort_by_key(|b| std::cmp::Reverse(b.order.created_at));
     log::debug!(
         "[orders_live] upserted pending order_id={}, total_pending={}",
         order_id,
@@ -136,7 +136,7 @@ pub fn start_fetch_scheduler(
     settings: &Settings,
     pool: SqlitePool,
 ) -> FetchSchedulerResult {
-    let orders: Arc<Mutex<Vec<SmallOrder>>> = Arc::new(Mutex::new(Vec::new()));
+    let orders: Arc<Mutex<Vec<BookOrder>>> = Arc::new(Mutex::new(Vec::new()));
     let disputes: Arc<Mutex<Vec<Dispute>>> = Arc::new(Mutex::new(Vec::new()));
 
     let (order_task, dispute_task) = spawn_fetch_scheduler_loops(
@@ -163,7 +163,7 @@ pub fn start_fetch_scheduler(
 pub fn spawn_fetch_scheduler_loops(
     client: Client,
     current_mostro_pubkey: Arc<Mutex<PublicKey>>,
-    orders: Arc<Mutex<Vec<SmallOrder>>>,
+    orders: Arc<Mutex<Vec<BookOrder>>>,
     disputes: Arc<Mutex<Vec<Dispute>>>,
     settings: &Settings,
     pool: SqlitePool,
@@ -313,11 +313,16 @@ pub fn spawn_fetch_scheduler_loops(
                         one.insert(event);
                         let latest_live = aggregate_latest_orders_by_id(&one);
                         for relay_order in latest_live.values() {
-                            reconcile_one_order_if_terminal(&pool_for_orders, relay_order).await;
+                            reconcile_one_order_if_terminal(&pool_for_orders, &relay_order.order).await;
                         }
                         let currencies = reloaded_settings.currencies_filter.clone();
-                        let mut parsed =
-                            super::parse_orders_events(one, Some(currencies), None, None);
+                        let mut parsed: Vec<BookOrder> = latest_live
+                            .into_values()
+                            .filter(|row| {
+                                currencies.is_empty()
+                                    || currencies.contains(&row.order.fiat_code)
+                            })
+                            .collect();
                         log::debug!(
                             "[orders_live] received order event, parsed_candidates={}",
                             parsed.len()
@@ -494,4 +499,45 @@ pub fn spawn_fetch_scheduler_loops(
     });
 
     (order_task, dispute_task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book_order(id: Uuid, status: Status, created_at: i64, rating: f64) -> BookOrder {
+        BookOrder::new(
+            SmallOrder {
+                id: Some(id),
+                kind: Some(mostro_core::order::Kind::Buy),
+                status: Some(status),
+                created_at: Some(created_at),
+                ..Default::default()
+            },
+            Some(UserInfo {
+                rating,
+                reviews: 1,
+                operating_days: 1,
+            }),
+        )
+    }
+
+    #[test]
+    fn live_order_update_replaces_rating_with_newer_revision() {
+        let id = Uuid::new_v4();
+        let orders = Arc::new(Mutex::new(vec![book_order(id, Status::Pending, 1, 3.0)]));
+        apply_live_order_update(&orders, book_order(id, Status::Pending, 2, 4.5));
+
+        let guard = orders.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].reputation.as_ref().unwrap().rating, 4.5);
+    }
+
+    #[test]
+    fn live_terminal_revision_removes_book_order_and_rating() {
+        let id = Uuid::new_v4();
+        let orders = Arc::new(Mutex::new(vec![book_order(id, Status::Pending, 1, 3.0)]));
+        apply_live_order_update(&orders, book_order(id, Status::Canceled, 2, 3.0));
+        assert!(orders.lock().unwrap().is_empty());
+    }
 }

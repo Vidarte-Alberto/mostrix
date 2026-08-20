@@ -680,7 +680,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         app.selected_order_id = None;
                         true
                     } else if let Some(id) = app.selected_order_id {
-                        g.iter().any(|o| o.id == Some(id))
+                        g.iter().any(|o| o.order.id == Some(id))
                     } else {
                         true
                     }

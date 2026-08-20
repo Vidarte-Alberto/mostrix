@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::models::Order;
+use crate::util::BookOrder;
 
 use super::helper::{
     aggregate_latest_orders_by_id, fetch_mostro_order_events, fetch_small_order_by_id_from_relay,
@@ -22,10 +23,10 @@ pub const TARGETED_RELAY_RECONCILE_MAX_PER_TICK: usize = 5;
 /// Fetch latest order snapshots from relays and apply [`reconcile_one_order_if_terminal`] for each entry.
 pub async fn reconcile_terminal_order_statuses_from_relay(
     pool: &SqlitePool,
-    relay_latest: &HashMap<Uuid, SmallOrder>,
+    relay_latest: &HashMap<Uuid, BookOrder>,
 ) -> Result<()> {
     for relay_order in relay_latest.values() {
-        reconcile_one_order_if_terminal(pool, relay_order).await;
+        reconcile_one_order_if_terminal(pool, &relay_order.order).await;
     }
     Ok(())
 }
@@ -209,20 +210,23 @@ mod tests {
             .await
             .unwrap();
 
-        let mut relay_latest: HashMap<Uuid, SmallOrder> = HashMap::new();
+        let mut relay_latest: HashMap<Uuid, BookOrder> = HashMap::new();
         relay_latest.insert(
             oid,
-            SmallOrder {
-                id: Some(oid),
-                kind: Some(mostro_core::order::Kind::Sell),
-                status: Some(Status::Expired),
-                amount: 10_000,
-                fiat_code: "EUR".to_string(),
-                fiat_amount: 50,
-                payment_method: "sepa".to_string(),
-                premium: 0,
-                ..Default::default()
-            },
+            BookOrder::new(
+                SmallOrder {
+                    id: Some(oid),
+                    kind: Some(mostro_core::order::Kind::Sell),
+                    status: Some(Status::Expired),
+                    amount: 10_000,
+                    fiat_code: "EUR".to_string(),
+                    fiat_amount: 50,
+                    payment_method: "sepa".to_string(),
+                    premium: 0,
+                    ..Default::default()
+                },
+                None,
+            ),
         );
 
         reconcile_terminal_order_statuses_from_relay(&pool, &relay_latest)
@@ -271,20 +275,23 @@ mod tests {
         .unwrap();
 
         let oid = Uuid::new_v4();
-        let mut relay_latest: HashMap<Uuid, SmallOrder> = HashMap::new();
+        let mut relay_latest: HashMap<Uuid, BookOrder> = HashMap::new();
         relay_latest.insert(
             oid,
-            SmallOrder {
-                id: Some(oid),
-                kind: Some(mostro_core::order::Kind::Buy),
-                status: Some(Status::Canceled),
-                amount: 1,
-                fiat_code: "USD".to_string(),
-                fiat_amount: 1,
-                payment_method: "x".to_string(),
-                premium: 0,
-                ..Default::default()
-            },
+            BookOrder::new(
+                SmallOrder {
+                    id: Some(oid),
+                    kind: Some(mostro_core::order::Kind::Buy),
+                    status: Some(Status::Canceled),
+                    amount: 1,
+                    fiat_code: "USD".to_string(),
+                    fiat_amount: 1,
+                    payment_method: "x".to_string(),
+                    premium: 0,
+                    ..Default::default()
+                },
+                None,
+            ),
         );
 
         reconcile_terminal_order_statuses_from_relay(&pool, &relay_latest)

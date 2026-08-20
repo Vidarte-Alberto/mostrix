@@ -519,6 +519,7 @@ mod tests {
                 kind: Some(mostro_core::order::Kind::Sell),
                 ..Default::default()
             },
+            maker_reputation: None,
             amount_input: "100".to_string(),
             is_range_order: true,
             validation_error: None,

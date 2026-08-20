@@ -58,4 +58,4 @@ pub use send_attachment::{
     blossom_servers_from_settings, send_prepared_order_chat_attachment,
     spawn_send_order_chat_attachment, SendOrderAttachmentJob,
 };
-pub use types::{get_cant_do_description, Event, ListKind};
+pub use types::{get_cant_do_description, BookOrder, Event, ListKind};

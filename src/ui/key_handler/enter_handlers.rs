@@ -3,7 +3,7 @@ use crate::shared::permissions::SolverPermission;
 use crate::ui::admin_state::AddSolverState;
 use crate::ui::helpers::{
     build_active_order_chat_list, save_order_chat_message, save_user_dispute_chat_message,
-    selected_filtered_book_order, selected_filtered_dispute, selected_pending_dispute,
+    selected_filtered_dispute, selected_pending_dispute,
 };
 use crate::ui::key_handler::chat_helpers::{
     build_order_action_view_state, handle_enter_finalize_popup, message_counter,
@@ -1044,7 +1044,10 @@ fn handle_enter_normal_mode(app: &mut AppState, ctx: &super::EnterKeyContext<'_>
                 return;
             }
         };
-        if let Some(order) = selected_filtered_book_order(app, &orders_lock) {
+        if let Some(book_order) =
+            crate::ui::helpers::selected_filtered_book_entry(app, &orders_lock)
+        {
+            let order = book_order.order;
             if let Some(order_id) = order
                 .id
                 .filter(|id| is_my_pending_book_order(app, *id, order.status))
@@ -1059,6 +1062,7 @@ fn handle_enter_normal_mode(app: &mut AppState, ctx: &super::EnterKeyContext<'_>
             let is_range_order = order.min_amount.is_some() || order.max_amount.is_some();
             let take_state = TakeOrderState {
                 order: order.clone(),
+                maker_reputation: book_order.reputation,
                 amount_input: String::new(),
                 is_range_order,
                 validation_error: None,

@@ -13,15 +13,11 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
     let popup_width = area.width.saturating_sub(area.width / 4);
     // Adjust height based on whether it's a range order (needs input field and error)
     // Calculate total height needed from the fixed constraints and surrounding popup space.
-    // Base constraints: spacer(1) + title(2) + separator(1) + kind(1) + currency(1) + fiat(1) + payment(1) + premium(1) + buttons(3) + help(1) = 13
+    // Base constraints include one maker-rating row in addition to the order economics.
     // For range: + label(1) + input(3) + error(1) + spacer(1) = +6 (always reserve error space to prevent resizing)
     // Popup border and vertical breathing room: +4
     // Keep these preferred heights stable while space permits; short terminals use a compact view.
-    let preferred_popup_height = if take_state.is_range_order {
-        23 // Base(13) + range(6) + popup space(4) = 23
-    } else {
-        17 // Base(13) + popup space(4) = 17
-    };
+    let preferred_popup_height = if take_state.is_range_order { 24 } else { 18 };
     let popup_height = preferred_popup_height.min(area.height);
     let compact = popup_height < preferred_popup_height;
     // Center the popup using Flex::Center
@@ -59,6 +55,7 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
         Constraint::Length(1), // fiat amount (or range)
         Constraint::Length(1), // payment method
         Constraint::Length(1), // premium
+        Constraint::Length(1), // maker rating
     ];
 
     // Add input field and error for range orders
@@ -159,15 +156,23 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
         inner_chunks[7],
     );
 
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("Maker Rating: "),
+            Span::styled(
+                maker_rating_text(take_state),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]))
+        .alignment(ratatui::layout::Alignment::Center),
+        inner_chunks[8],
+    );
+
     // Input field for range orders
     // Calculate button index: buttons come after premium and any range fields
     // For range orders: indices 0-6 (base), 7 (premium), 8-10 (range fields), 11 (buttons)
     // For non-range: indices 0-6 (base), 7 (premium), 8 (buttons)
-    let button_idx = if take_state.is_range_order {
-        11 // range fields at 8-10, buttons at 11
-    } else {
-        8 // premium at 7, buttons at 8
-    };
+    let button_idx = if take_state.is_range_order { 12 } else { 9 };
 
     if take_state.is_range_order {
         let min = take_state.order.min_amount.unwrap_or(0);
@@ -185,7 +190,7 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
                 Span::raw("):"),
             ]))
             .alignment(ratatui::layout::Alignment::Center),
-            inner_chunks[8],
+            inner_chunks[9],
         );
 
         // Input box with borders
@@ -205,7 +210,7 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
         };
 
         // Create a smaller input box centered in the area
-        let input_area = inner_chunks[9];
+        let input_area = inner_chunks[10];
         let input_width = (input_area.width * 2 / 3).min(30); // Max 30 chars wide, 2/3 of available width
         let input_x = input_area.x + (input_area.width.saturating_sub(input_width)) / 2;
         let input_rect = Rect {
@@ -238,7 +243,7 @@ pub fn render_order_take(f: &mut ratatui::Frame, take_state: &TakeOrderState) {
         );
 
         // Error message - always render in reserved space (show empty if no error)
-        let error_chunk = inner_chunks[10];
+        let error_chunk = inner_chunks[11];
         if let Some(error_msg) = &take_state.validation_error {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
@@ -300,6 +305,10 @@ fn render_compact_order_take(f: &mut ratatui::Frame, area: Rect, take_state: &Ta
         Constraint::Length(1), // fiat amount
         Constraint::Length(1), // premium
     ];
+    let show_rating = details_area.height >= 3;
+    if show_rating {
+        constraints.push(Constraint::Length(1));
+    }
     if detailed_range_input {
         constraints.push(Constraint::Length(1)); // amount label
         constraints.push(Constraint::Length(3)); // amount input
@@ -339,6 +348,15 @@ fn render_compact_order_take(f: &mut ratatui::Frame, area: Rect, take_state: &Ta
         chunks[1],
     );
 
+    let range_start = if show_rating { 3 } else { 2 };
+    if show_rating {
+        f.render_widget(
+            Paragraph::new(format!("Maker Rating: {}", maker_rating_text(take_state)))
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[2],
+        );
+    }
+
     if detailed_range_input {
         let min = take_state.order.min_amount.unwrap_or(0);
         let max = take_state.order.max_amount.unwrap_or(0);
@@ -346,7 +364,7 @@ fn render_compact_order_take(f: &mut ratatui::Frame, area: Rect, take_state: &Ta
         f.render_widget(
             Paragraph::new(format!("Enter amount ({min}-{max} {currency}):"))
                 .alignment(ratatui::layout::Alignment::Center),
-            chunks[2],
+            chunks[range_start],
         );
 
         let input_text = if take_state.amount_input.is_empty() {
@@ -358,9 +376,9 @@ fn render_compact_order_take(f: &mut ratatui::Frame, area: Rect, take_state: &Ta
             Paragraph::new(format!("{input_text} {currency}"))
                 .alignment(ratatui::layout::Alignment::Center)
                 .block(Block::default().borders(Borders::ALL)),
-            chunks[3],
+            chunks[range_start + 1],
         );
-    } else if compact_range_input && chunks.len() > 2 {
+    } else if compact_range_input && chunks.len() > range_start {
         let min = take_state.order.min_amount.unwrap_or(0);
         let input_text = if take_state.amount_input.is_empty() {
             min.to_string()
@@ -373,11 +391,26 @@ fn render_compact_order_take(f: &mut ratatui::Frame, area: Rect, take_state: &Ta
                 take_state.order.fiat_code
             ))
             .alignment(ratatui::layout::Alignment::Center),
-            chunks[2],
+            chunks[range_start],
         );
     }
 
     render_take_buttons(f, button_area, take_state.selected_button);
+}
+
+fn maker_rating_text(take_state: &TakeOrderState) -> String {
+    take_state
+        .maker_reputation
+        .as_ref()
+        .map(|info| {
+            format!(
+                "⭐ {:.1}/5 ({} reviews, {} days)",
+                info.rating.clamp(0.0, 5.0),
+                info.reviews,
+                info.operating_days
+            )
+        })
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn render_take_buttons(f: &mut ratatui::Frame, area: Rect, selected_button: bool) {
@@ -495,6 +528,11 @@ mod tests {
                 payment_method: "SPEI".to_string(),
                 ..Default::default()
             },
+            maker_reputation: Some(mostro_core::prelude::UserInfo {
+                rating: 4.7,
+                reviews: 23,
+                operating_days: 120,
+            }),
             amount_input: String::new(),
             is_range_order,
             validation_error: None,
@@ -512,6 +550,8 @@ mod tests {
             let buf = render_take_order(100, 30, is_range_order);
             assert!(buffer_contains(&buf, "Premium:"));
             assert!(buffer_contains(&buf, "-3%"));
+            assert!(buffer_contains(&buf, "Maker Rating:"));
+            assert!(buffer_contains(&buf, "4.7/5"));
             assert!(buffer_contains(&buf, "SPEI"));
             assert!(buffer_contains(&buf, "YES"));
             assert!(buffer_contains(&buf, "NO"));
@@ -523,6 +563,7 @@ mod tests {
         for is_range_order in [false, true] {
             let buf = render_take_order(60, 10, is_range_order);
             assert!(buffer_contains(&buf, "Premium:"));
+            assert!(buffer_contains(&buf, "Maker Rating:"));
             assert!(buffer_contains(&buf, "-3%"));
             assert!(buffer_contains(&buf, "YES"));
             assert!(buffer_contains(&buf, "NO"));

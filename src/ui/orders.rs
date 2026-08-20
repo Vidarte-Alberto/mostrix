@@ -332,6 +332,7 @@ impl FormState {
 #[derive(Clone, Debug)]
 pub struct TakeOrderState {
     pub order: SmallOrder,
+    pub maker_reputation: Option<UserInfo>,
     pub amount_input: String, // For range orders: the amount user wants to take
     pub is_range_order: bool, // Whether this is a range order (has min/max)
     pub validation_error: Option<String>, // Error message if amount is invalid

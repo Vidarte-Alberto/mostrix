@@ -2,6 +2,21 @@
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+/// Public order-book row enriched with the maker reputation snapshot published
+/// on the same kind-38383 event.
+#[derive(Clone, Debug)]
+pub struct BookOrder {
+    pub order: SmallOrder,
+    pub reputation: Option<UserInfo>,
+}
+
+impl BookOrder {
+    #[must_use]
+    pub fn new(order: SmallOrder, reputation: Option<UserInfo>) -> Self {
+        Self { order, reputation }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ListKind {
     Orders,

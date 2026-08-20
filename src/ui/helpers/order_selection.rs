@@ -10,21 +10,22 @@ use mostro_core::prelude::SmallOrder;
 use uuid::Uuid;
 
 use crate::ui::AppState;
+use crate::util::BookOrder;
 
 /// Whether `order` passes the active currency filter (empty filter = all pass).
-pub fn order_passes_currency_filter(order: &SmallOrder, currencies_filter: &[String]) -> bool {
+pub fn order_passes_currency_filter(order: &BookOrder, currencies_filter: &[String]) -> bool {
     if currencies_filter.is_empty() {
         return true;
     }
     let filter_set: HashSet<String> = currencies_filter.iter().map(|c| c.to_uppercase()).collect();
-    filter_set.contains(&order.fiat_code.to_uppercase())
+    filter_set.contains(&order.order.fiat_code.to_uppercase())
 }
 
 /// Currency-filtered book rows as `(original_index, order)` pairs.
 pub fn get_filtered_book_orders(
-    orders: &[SmallOrder],
+    orders: &[BookOrder],
     currencies_filter: &[String],
-) -> Vec<(usize, SmallOrder)> {
+) -> Vec<(usize, BookOrder)> {
     orders
         .iter()
         .enumerate()
@@ -39,14 +40,14 @@ pub fn get_filtered_book_orders(
 /// id is hidden by the currency filter. Returns `None` only when `filtered` is empty.
 pub fn selected_book_display_idx(
     selected_order_id: Option<Uuid>,
-    filtered: &[(usize, SmallOrder)],
+    filtered: &[(usize, BookOrder)],
 ) -> Option<usize> {
     if filtered.is_empty() {
         return None;
     }
     Some(
         selected_order_id
-            .and_then(|id| filtered.iter().position(|(_, o)| o.id == Some(id)))
+            .and_then(|id| filtered.iter().position(|(_, o)| o.order.id == Some(id)))
             .unwrap_or(0),
     )
 }
@@ -55,7 +56,12 @@ pub fn selected_book_display_idx(
 ///
 /// Resolves `selected_order_id` against the currency-filtered book so Enter/take
 /// always acts on the highlighted row — never on a row hidden by the filter.
-pub fn selected_filtered_book_order(app: &AppState, orders: &[SmallOrder]) -> Option<SmallOrder> {
+pub fn selected_filtered_book_order(app: &AppState, orders: &[BookOrder]) -> Option<SmallOrder> {
+    selected_filtered_book_entry(app, orders).map(|entry| entry.order)
+}
+
+/// Enriched order-book row currently shown as selected.
+pub fn selected_filtered_book_entry(app: &AppState, orders: &[BookOrder]) -> Option<BookOrder> {
     let mut filtered = get_filtered_book_orders(orders, &app.currencies_filter);
     let idx = selected_book_display_idx(app.selected_order_id, &filtered)?;
     Some(filtered.swap_remove(idx).1)
@@ -63,7 +69,7 @@ pub fn selected_filtered_book_order(app: &AppState, orders: &[SmallOrder]) -> Op
 
 /// Move Orders-tab selection `delta` rows within the filtered book, clamping at
 /// both ends, and store the landing order's id (when present).
-pub fn move_book_order_selection(app: &mut AppState, orders: &[SmallOrder], delta: isize) {
+pub fn move_book_order_selection(app: &mut AppState, orders: &[BookOrder], delta: isize) {
     let filtered = get_filtered_book_orders(orders, &app.currencies_filter);
     let Some(idx) = selected_book_display_idx(app.selected_order_id, &filtered) else {
         app.selected_order_id = None;
@@ -72,7 +78,7 @@ pub fn move_book_order_selection(app: &mut AppState, orders: &[SmallOrder], delt
     let new_idx = idx
         .saturating_add_signed(delta)
         .min(filtered.len().saturating_sub(1));
-    app.selected_order_id = filtered[new_idx].1.id;
+    app.selected_order_id = filtered[new_idx].1.order.id;
 }
 
 #[cfg(test)]
@@ -81,16 +87,19 @@ mod tests {
     use crate::ui::UserRole;
     use mostro_core::prelude::Kind;
 
-    fn order(id: Uuid, fiat: &str, payment: &str) -> SmallOrder {
-        SmallOrder {
-            id: Some(id),
-            kind: Some(Kind::Buy),
-            fiat_code: fiat.to_string(),
-            fiat_amount: 100,
-            amount: 50_000,
-            payment_method: payment.to_string(),
-            ..Default::default()
-        }
+    fn order(id: Uuid, fiat: &str, payment: &str) -> BookOrder {
+        BookOrder::new(
+            SmallOrder {
+                id: Some(id),
+                kind: Some(Kind::Buy),
+                fiat_code: fiat.to_string(),
+                fiat_amount: 100,
+                amount: 50_000,
+                payment_method: payment.to_string(),
+                ..Default::default()
+            },
+            None,
+        )
     }
 
     #[test]
@@ -109,7 +118,7 @@ mod tests {
         let orders = vec![order(a, "USD", "sepa"), order(b, "EUR", "sepa")];
         let filtered = get_filtered_book_orders(&orders, &["EUR".to_string()]);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].1.id, Some(b));
+        assert_eq!(filtered[0].1.order.id, Some(b));
     }
 
     /// Regression for the highlight/Enter mismatch: after a currency filter hides

@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use mostro_core::prelude::*;
 use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -56,7 +55,7 @@ fn shell_chrome_heights(total_height: u16, show_status: bool) -> (u16, u16) {
 pub fn ui_draw(
     f: &mut ratatui::Frame,
     app: &mut AppState,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<mostro_core::prelude::Dispute>>>,
     status_line: Option<&[String]>,
 ) {

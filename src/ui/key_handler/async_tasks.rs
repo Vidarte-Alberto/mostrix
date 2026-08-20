@@ -18,7 +18,7 @@ use crate::util::{
     set_dm_router_cmd_tx, unsubscribe_dm_listener_subscriptions, ChatRouterCmd,
     OrderDmSubscriptionCmd, StartupDmHydration,
 };
-use mostro_core::prelude::{Dispute, SmallOrder, Transport};
+use mostro_core::prelude::{Dispute, Transport};
 use nostr_sdk::prelude::{Client, Keys, Output, PublicKey, SignerAuthenticator};
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -40,7 +40,7 @@ pub struct RuntimeReconnectContext<'a> {
     pub pool: &'a SqlitePool,
     pub message_listener_handle: &'a mut JoinHandle<()>,
     pub message_notification_tx: &'a UnboundedSender<MessageNotification>,
-    pub orders: Arc<Mutex<Vec<SmallOrder>>>,
+    pub orders: Arc<Mutex<Vec<crate::util::BookOrder>>>,
     pub disputes: Arc<Mutex<Vec<Dispute>>>,
     pub order_fetch_task: &'a mut JoinHandle<()>,
     pub dispute_fetch_task: &'a mut JoinHandle<()>,
@@ -244,7 +244,7 @@ pub async fn apply_pending_key_reload(
     pool: &SqlitePool,
     message_listener_handle: &mut JoinHandle<()>,
     message_notification_tx: &UnboundedSender<MessageNotification>,
-    orders: Arc<Mutex<Vec<SmallOrder>>>,
+    orders: Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: Arc<Mutex<Vec<Dispute>>>,
     order_fetch_task: &mut JoinHandle<()>,
     dispute_fetch_task: &mut JoinHandle<()>,
@@ -459,7 +459,7 @@ pub async fn apply_pending_fetch_scheduler_reload(
     mostro_pubkey: &mut PublicKey,
     current_mostro_pubkey: &Arc<Mutex<PublicKey>>,
     pool: &SqlitePool,
-    orders: Arc<Mutex<Vec<SmallOrder>>>,
+    orders: Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: Arc<Mutex<Vec<Dispute>>>,
     order_fetch_task: &mut JoinHandle<()>,
     dispute_fetch_task: &mut JoinHandle<()>,
@@ -594,7 +594,7 @@ pub async fn apply_pending_runtime_reloads(
     pool: &SqlitePool,
     message_listener_handle: &mut JoinHandle<()>,
     message_notification_tx: &UnboundedSender<MessageNotification>,
-    orders: &Arc<Mutex<Vec<SmallOrder>>>,
+    orders: &Arc<Mutex<Vec<crate::util::BookOrder>>>,
     disputes: &Arc<Mutex<Vec<Dispute>>>,
     order_fetch_task: &mut JoinHandle<()>,
     dispute_fetch_task: &mut JoinHandle<()>,
